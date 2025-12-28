@@ -36,17 +36,15 @@ def get_signal_data(symbol):
     
     # 綜合檔位線 (HMA)
     df['Final_Score'] = ta.hma((df['bias_20'] * 0.5 + df['rsi_r'] * 0.3 + df['macd_r'] * 0.2), length=10)
-    df['Lower_Bound'] = df['Final_Score'].rolling(252).quantile(0.12) # 抄底門檻
-    df['Upper_Bound'] = df['Final_Score'].rolling(252).quantile(0.88) # 過熱門檻
+    df['Lower_Bound'] = df['Final_Score'].rolling(252).quantile(0.12)
+    df['Upper_Bound'] = df['Final_Score'].rolling(252).quantile(0.88)
     
     # --- 訊號邏輯 ---
-    df['Signal'] = "HOLD" # 預設持有/觀望
-    
-    # 買入：分數低於下限 且 成交量萎縮
+    df['Signal'] = "HOLD"
     vol_ma = df['Volume'].rolling(20).mean()
+    # 買入：分數低於下限 且 成交量萎縮 (避免接刀)
     df.loc[(df['Final_Score'] <= df['Lower_Bound']) & (df['Volume'] < vol_ma), 'Signal'] = "BUY"
-    
-    # 賣出：分數高於上限 且 開始轉折向下
+    # 賣出：分數高於上限 且 轉折向下
     df.loc[(df['Final_Score'] >= df['Upper_Bound']) & (df['Final_Score'] < df['Final_Score'].shift(1)), 'Signal'] = "SELL"
     
     return df, ticker.info
@@ -69,8 +67,8 @@ with tab1:
             sig_text = "⚪ 觀望"
             if curr['Signal'] == "BUY": sig_text = "🟢 買入 (抄底)"
             elif curr['Signal'] == "SELL": sig_text = "🔴 賣出 (獲利)"
-            elif curr['Final_Score'] < 20: sig_text = "🟡 準備買入"
-            elif curr['Final_Score'] > 80: sig_text = "🟠 準備賣出"
+            elif curr['Final_Score'] < 15: sig_text = "🟡 準備買入"
+            elif curr['Final_Score'] > 85: sig_text = "🟠 準備賣出"
 
             radar_results.append({
                 "標的": name, 
@@ -80,7 +78,7 @@ with tab1:
                 "昨日分數": round(prev['Final_Score'], 1)
             })
     
-    st.table(pd.DataFrame(radar_results).sort_values("今日指令"))
+    st.table(pd.DataFrame(radar_results))
 
 with tab2:
     st.sidebar.header("🔍 標的選擇")
@@ -96,42 +94,54 @@ with tab2:
         # 價格線
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name="收盤價", line=dict(color="#FFFFFF", width=2)), secondary_y=False)
         
-        # 標記訊號點在價格線上
+        # 修正後的檔位線 (使用 RGBA 代替 opacity)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['Final_Score'], name="檔位", 
+            line=dict(color="rgba(0, 191, 255, 0.5)", width=1.5)
+        ), secondary_y=True)
+        
+        # 標記買賣點
         buys = df[df['Signal'] == "BUY"]
         sells = df[df['Signal'] == "SELL"]
         
         fig.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers', 
-                                 marker=dict(color="#00FF00", size=12, symbol="triangle-up"), name="買入訊號"), secondary_y=False)
+                                 marker=dict(color="#00FF00", size=12, symbol="triangle-up"), name="買"), secondary_y=False)
         fig.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers', 
-                                 marker=dict(color="#FF0000", size=12, symbol="triangle-down"), name="賣出訊號"), secondary_y=False)
-        
-        # 輔助檔位線
-        fig.add_trace(go.Scatter(x=df.index, y=df['Final_Score'], name="檔位", line=dict(color="#00BFFF", width=1.5, opacity=0.5)), secondary_y=True)
+                                 marker=dict(color="#FF0000", size=12, symbol="triangle-down"), name="賣"), secondary_y=False)
         
         fig.update_xaxes(range=[df.index[-1] - pd.Timedelta(days=90), df.index[-1]])
-        fig.update_layout(height=450, template="plotly_dark", showlegend=False)
+        fig.update_layout(height=450, template="plotly_dark", showlegend=False, margin=dict(l=50, r=50, t=20, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- 歷史明細分頁 ---
+        # --- 歷史明細分頁 (帶防錯) ---
         st.markdown("---")
-        st.subheader("🏛️ 歷史買賣指令明細 (每頁 10 筆)")
+        st.subheader("🏛️ 歷史買賣指令明細")
         full_h = df.tail(252).copy()
         recs = []
         for i in range(len(full_h)-1, -1, -1):
             r = full_h.iloc[i]
-            if r['Signal'] != "HOLD": # 只有出現買賣訊號才記錄
+            if r['Signal'] != "HOLD":
                 recs.append({
                     "日期": full_h.index[i].strftime('%Y/%m/%d'),
                     "執行動作": "🟢 買入" if r['Signal'] == "BUY" else "🔴 賣出",
-                    "成交價(參考)": f"{r['Close']:.2f}",
+                    "成交價": f"{r['Close']:.2f}",
                     "檔位分數": f"{r['Final_Score']:.1f}"
                 })
         
-        if 'p_sig' not in st.session_state: st.session_state.p_sig = 0
+        # 分頁處理
+        if 'p_sig_v4' not in st.session_state: st.session_state.p_sig_v4 = 0
+        
+        # 確保分頁不超出當前搜尋標的的紀錄範圍
+        max_pages = max(0, (len(recs) - 1) // 10)
+        st.session_state.p_sig_v4 = min(st.session_state.p_sig_v4, max_pages)
+
         c1, c2, c3 = st.columns([1, 2, 1])
         with c1: 
-            if st.button("⬅️ 上一頁"): st.session_state.p_sig = max(0, st.session_state.p_sig - 1)
+            if st.button("⬅️ 上一頁") and st.session_state.p_sig_v4 > 0:
+                st.session_state.p_sig_v4 -= 1
         with c3: 
-            if st.button("下一頁 ➡️"): st.session_state.p_sig += 1
+            if st.button("下一頁 ➡️") and st.session_state.p_sig_v4 < max_pages:
+                st.session_state.p_sig_v4 += 1
         
-        st.table(pd.DataFrame(recs[st.session_state.p_sig*10 : st.session_state.p_sig*10+10]))
+        start_i = st.session_state.p_sig_v4 * 10
+        st.table(pd.DataFrame(recs[start_i : start_i+10]))
