@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # 1. 頁面基礎設定
-st.set_page_config(page_title="五維策略：收盤價訊號終端", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="五維策略：終極指令版", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("<style>.main { background-color: #0e1117; color: white; }</style>", unsafe_allow_html=True)
 
 ASSET_LIST = {
@@ -16,7 +16,7 @@ ASSET_LIST = {
         "2881.TW": "富邦金", "2882.TW": "國泰金", "2382.TW": "廣達", "2891.TW": "中信金",
         "3711.TW": "日月光投控", "2412.TW": "中華電"
     },
-    "熱門 ETF": {
+    "優秀 ETF": {
         "0050.TW": "元大台灣50", "0056.TW": "元大高股息", "00878.TW": "國泰永續高股息", "00919.TW": "群益精選高息"
     }
 }
@@ -42,18 +42,18 @@ def get_signal_data(symbol):
     # --- 訊號邏輯 ---
     df['Signal'] = "HOLD"
     vol_ma = df['Volume'].rolling(20).mean()
-    # 買入：分數低於下限 且 成交量萎縮
+    # 買入：分數低於下限 且 成交量萎縮 (量縮代表賣壓竭盡)
     df.loc[(df['Final_Score'] <= df['Lower_Bound']) & (df['Volume'] < vol_ma), 'Signal'] = "BUY"
-    # 賣出：分數高於上限 且 轉折向下
+    # 賣出：分數高於上限 且 轉折向下 (動能竭盡)
     df.loc[(df['Final_Score'] >= df['Upper_Bound']) & (df['Final_Score'] < df['Final_Score'].shift(1)), 'Signal'] = "SELL"
     
     return df, ticker.info
 
-# --- 分頁系統 ---
+# --- 介面分頁 ---
 tab1, tab2 = st.tabs(["🎯 即時買賣指令", "📈 訊號圖表分析"])
 
 with tab1:
-    st.subheader("🚀 2025 全資產收盤價訊號總覽")
+    st.subheader("🚀 2025 全資產收盤價訊號表")
     all_symbols = {}
     for cat in ASSET_LIST: all_symbols.update(ASSET_LIST[cat])
     
@@ -71,11 +71,8 @@ with tab1:
             elif curr['Final_Score'] > 85: sig_text = "🟠 準備賣出"
 
             radar_results.append({
-                "標的": name, 
-                "收盤價": f"{curr['Close']:.2f}",
-                "今日指令": sig_text,
-                "檔位分數": round(curr['Final_Score'], 1),
-                "昨日分數": round(prev['Final_Score'], 1)
+                "標的": name, "收盤價": f"{curr['Close']:.2f}",
+                "今日指令": sig_text, "檔位分數": round(curr['Final_Score'], 1), "昨日分數": round(prev['Final_Score'], 1)
             })
     st.table(pd.DataFrame(radar_results))
 
@@ -90,25 +87,24 @@ with tab2:
         st.subheader(f"📈 {asset_name} ({sid})：收盤價買賣訊號圖")
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         
-        # 1. 價格線
+        # 價格主線
         fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name="收盤價", line=dict(color="#FFFFFF", width=2)), secondary_y=False)
         
-        # 2. 修正後的檔位線 (將 opacity 移出 line 字典)
+        # --- 修正處：將 opacity 移出 line 字典 ---
         fig.add_trace(go.Scatter(
-            x=df.index, y=df['Final_Score'], 
-            name="檔位", 
+            x=df.index, y=df['Final_Score'], name="檔位線", 
             line=dict(color="#00BFFF", width=1.5),
-            opacity=0.5 # 正確的設定位置
+            opacity=0.4 # 正確的寫法在這裡
         ), secondary_y=True)
         
-        # 3. 標記買賣點
+        # 標記買點與賣點 (釘在收盤價上)
         buys = df[df['Signal'] == "BUY"]
         sells = df[df['Signal'] == "SELL"]
         fig.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers', marker=dict(color="#00FF00", size=12, symbol="triangle-up"), name="買"), secondary_y=False)
         fig.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers', marker=dict(color="#FF0000", size=12, symbol="triangle-down"), name="賣"), secondary_y=False)
         
         fig.update_xaxes(range=[df.index[-1] - pd.Timedelta(days=90), df.index[-1]])
-        fig.update_layout(height=450, template="plotly_dark", showlegend=False)
+        fig.update_layout(height=450, template="plotly_dark", showlegend=False, margin=dict(l=50, r=50, t=20, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
         # --- 歷史明細分頁 ---
@@ -126,18 +122,14 @@ with tab2:
                     "檔位分數": f"{r['Final_Score']:.1f}"
                 })
         
-        if 'p_sig_v5' not in st.session_state: st.session_state.p_sig_v5 = 0
-        
-        # 確保分頁不溢出
-        total_recs = len(recs)
-        max_p = max(0, (total_recs - 1) // 10)
-        st.session_state.p_sig_v5 = min(st.session_state.p_sig_v5, max_p)
+        if 'p_idx_v6' not in st.session_state: st.session_state.p_idx_v6 = 0
+        max_p = max(0, (len(recs) - 1) // 10)
+        st.session_state.p_idx_v6 = min(st.session_state.p_idx_v6, max_p)
 
         c1, c2, c3 = st.columns([1, 2, 1])
-        with c1: 
-            if st.button("⬅️ 上一頁") and st.session_state.p_sig_v5 > 0: st.session_state.p_sig_v5 -= 1
-        with c3: 
-            if st.button("下一頁 ➡️") and st.session_state.p_sig_v5 < max_p: st.session_state.p_sig_v5 += 1
+        with c1:
+            if st.button("⬅️ 上一頁") and st.session_state.p_idx_v6 > 0: st.session_state.p_idx_v6 -= 1
+        with c3:
+            if st.button("下一頁 ➡️") and st.session_state.p_idx_v6 < max_p: st.session_state.p_idx_v6 += 1
         
-        start_idx = st.session_state.p_sig_v5 * 10
-        st.table(pd.DataFrame(recs[start_idx : start_idx+10]))
+        st.table(pd.DataFrame(recs[st.session_state.p_idx_v6*10 : st.session_state.p_idx_v6*10+10]))
