@@ -2,72 +2,69 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# 頁面配置
-st.set_page_config(page_title="專業個股分析系統", layout="wide")
+st.set_page_config(page_title="頂尖選股評分系統", layout="wide")
+st.title("⚖️ 權重化投資決策指標系統")
 
-st.title("🔍 全球個股即時分析系統")
-st.markdown("輸入股票代碼（美股如 `AAPL`, 台股如 `2330.TW`）即可獲取深度報告")
+ticker = st.text_input("輸入股票代碼", "NVDA").upper()
 
-# 1. 搜尋列
-search_ticker = st.text_input("請輸入股票代碼", value="NVDA").upper()
+if ticker:
+    stock = yf.Ticker(ticker)
+    # 抓取較長時間數據以計算均線
+    df = stock.history(period="2y")
+    info = stock.info
 
-if search_ticker:
-    try:
-        # 抓取數據
-        stock = yf.Ticker(search_ticker)
-        info = stock.info
-        hist = stock.history(period="1y") # 抓取一年歷史數據
+    if not df.empty:
+        # --- 數據計算層 ---
+        # 1. 動能指標：股價與 MA20 的距離 (20-day Moving Average)
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA60'] = df['Close'].rolling(window=60).mean()
+        # 動能得分：現價高於 MA20 且 MA20 > MA60 得分高
+        df['Momentum_Score'] = ((df['Close'] > df['MA20']).astype(int) * 50 + 
+                                (df['MA20'] > df['MA60']).astype(int) * 50)
 
-        if hist.empty:
-            st.error("找不到該股票數據，請檢查代碼是否正確。")
+        # 2. 價值與品質得分 (固定值，來自財報)
+        roe = info.get('returnOnEquity', 0)
+        pe = info.get('trailingPE', 50)
+        
+        # 品質得分 (ROE > 0.15 為滿分)
+        quality_score = min(roe / 0.15, 1.0) * 100
+        # 價值得分 (PE < 20 為滿分)
+        value_score = max(0, (1 - (pe / 60))) * 100
+
+        # 3. 權重計算 (40% 動能 + 30% 品質 + 30% 價值)
+        df['Final_Score'] = (df['Momentum_Score'] * 0.4 + 
+                             quality_score * 0.3 + 
+                             value_score * 0.3)
+
+        # --- 繪圖層 ---
+        # 建立兩個子圖：上方 K 線，下方評分線
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                           vertical_spacing=0.1, subplot_titles=(f'{ticker} 股價', '綜合買入建議分數 (0-100)'),
+                           row_heights=[0.7, 0.3])
+
+        # 子圖 1：K 線與均線
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="股價"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name="MA20", line=dict(color='blue', width=1)), row=1, col=1)
+
+        # 子圖 2：買入判斷線 (這就是你要求的那條線)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Final_Score'], name="投資價值分", line=dict(color='red', width=2), fill='tozeroy'), row=2, col=1)
+        
+        # 加入門檻基準線 (70分以上為強力建議區)
+        fig.add_hline(y=70, line_dash="dash", line_color="green", annotation_text="強烈買入區", row=2, col=1)
+        fig.add_hline(y=40, line_dash="dash", line_color="orange", annotation_text="觀望區", row=2, col=1)
+
+        fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # --- 即時診斷 ---
+        current_score = df['Final_Score'].iloc[-1]
+        st.subheader(f"🚩 當前評分：{current_score:.1f} / 100")
+        
+        if current_score >= 70:
+            st.success("🔥 現在是理想的買入時機：指標顯示基本面強勁且技術面處於多頭。")
+        elif current_score >= 40:
+            st.warning("⚠️ 建議觀望：目前分數處於中性區間，等待趨勢明朗。")
         else:
-            # 2. 顯示基本面資訊儀表板
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("現價", f"{info.get('currentPrice', 'N/A')} {info.get('currency')}")
-            with col2:
-                roe = info.get('returnOnEquity', 0) * 100
-                st.metric("ROE", f"{roe:.2f}%")
-            with col3:
-                pe = info.get('trailingPE', 'N/A')
-                st.metric("本益比 (P/E)", f"{pe}")
-            with col4:
-                rev_growth = info.get('revenueGrowth', 0) * 100
-                st.metric("營收成長 (YoY)", f"{rev_growth:.2f}%")
-
-            # 3. 繪製互動式 K 線圖 (Candlestick)
-            st.subheader(f"📈 {info.get('shortName')} 股價走勢圖")
-            fig = go.Figure(data=[go.Candlestick(
-                x=hist.index,
-                open=hist['Open'],
-                high=hist['High'],
-                low=hist['Low'],
-                close=hist['Close'],
-                name="K線"
-            )])
-            
-            # 加入 200日均線 (MA200)
-            hist['MA200'] = hist['Close'].rolling(window=200).mean()
-            fig.add_trace(go.Scatter(x=hist.index, y=hist['MA200'], name="MA200", line=dict(color='orange', width=2)))
-            
-            fig.update_layout(xaxis_rangeslider_visible=False, height=600)
-            st.plotly_chart(fig, use_container_width=True)
-
-            # 4. 分析師觀點 (邏輯判斷)
-            st.subheader("💡 系統綜合評估")
-            advice = []
-            if roe > 15: advice.append("✅ 高效獲利能力 (ROE > 15%)")
-            if info.get('currentPrice', 0) > info.get('twoHundredDayAverage', 0): advice.append("✅ 趨勢偏多 (現價高於 MA200)")
-            if rev_growth > 20: advice.append("✅ 強勁成長力道 (YoY > 20%)")
-            
-            if advice:
-                for item in advice:
-                    st.write(item)
-            else:
-                st.write("該標的目前未觸發任何核心選股邏輯，建議審慎觀察。")
-
-    except Exception as e:
-        st.error(f"發生錯誤: {e}")
-
-st.sidebar.markdown("### 開發筆記\n1. 輸入 `2330.TW` 查詢台積電\n2. 數據由 yfinance 提供\n3. 圖表支援滾輪縮放")
+            st.error("❄️ 暫不建議介入：指標顯示估值過高、獲利平庸或趨勢已轉弱。")
