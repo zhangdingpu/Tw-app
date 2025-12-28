@@ -4,3 +4,5 @@ pandas
 numpy
 pandas_ta
 plotly
+mplfinance
+matplotlib
