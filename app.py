@@ -1,135 +1,73 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import yfinance as yf
-import pandas_ta as ta
+import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# 1. 頁面基礎設定
-st.set_page_config(page_title="五維策略：終極指令版", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("<style>.main { background-color: #0e1117; color: white; }</style>", unsafe_allow_html=True)
+# 頁面配置
+st.set_page_config(page_title="專業個股分析系統", layout="wide")
 
-ASSET_LIST = {
-    "市值前十大公司": {
-        "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2308.TW": "台達電",
-        "2881.TW": "富邦金", "2882.TW": "國泰金", "2382.TW": "廣達", "2891.TW": "中信金",
-        "3711.TW": "日月光投控", "2412.TW": "中華電"
-    },
-    "優秀 ETF": {
-        "0050.TW": "元大台灣50", "0056.TW": "元大高股息", "00878.TW": "國泰永續高股息", "00919.TW": "群益精選高息"
-    }
-}
+st.title("🔍 全球個股即時分析系統")
+st.markdown("輸入股票代碼（美股如 `AAPL`, 台股如 `2330.TW`）即可獲取深度報告")
 
-@st.cache_data(ttl=300)
-def get_signal_data(symbol):
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period="max", auto_adjust=True)
-    if df.empty: return df, None
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    
-    # --- 核心指標計算 ---
-    df['rsi_r'] = ta.rsi(df['Close'], length=14).rolling(252).rank(pct=True) * 100
-    df['bias_20'] = ((df['Close'] - df['Close'].rolling(20).mean()) / df['Close'].rolling(20).mean()).rolling(252).rank(pct=True) * 100
-    macd = ta.macd(df['Close'], fast=6, slow=13, signal=5)
-    df['macd_r'] = macd['MACDh_6_13_5'].rolling(252).rank(pct=True) * 100
-    
-    # 綜合檔位線 (HMA)
-    df['Final_Score'] = ta.hma((df['bias_20'] * 0.5 + df['rsi_r'] * 0.3 + df['macd_r'] * 0.2), length=10)
-    df['Lower_Bound'] = df['Final_Score'].rolling(252).quantile(0.12)
-    df['Upper_Bound'] = df['Final_Score'].rolling(252).quantile(0.88)
-    
-    # --- 訊號邏輯 ---
-    df['Signal'] = "HOLD"
-    vol_ma = df['Volume'].rolling(20).mean()
-    # 買入：分數低於下限 且 成交量萎縮 (量縮代表賣壓竭盡)
-    df.loc[(df['Final_Score'] <= df['Lower_Bound']) & (df['Volume'] < vol_ma), 'Signal'] = "BUY"
-    # 賣出：分數高於上限 且 轉折向下 (動能竭盡)
-    df.loc[(df['Final_Score'] >= df['Upper_Bound']) & (df['Final_Score'] < df['Final_Score'].shift(1)), 'Signal'] = "SELL"
-    
-    return df, ticker.info
+# 1. 搜尋列
+search_ticker = st.text_input("請輸入股票代碼", value="NVDA").upper()
 
-# --- 介面分頁 ---
-tab1, tab2 = st.tabs(["🎯 即時買賣指令", "📈 訊號圖表分析"])
+if search_ticker:
+    try:
+        # 抓取數據
+        stock = yf.Ticker(search_ticker)
+        info = stock.info
+        hist = stock.history(period="1y") # 抓取一年歷史數據
 
-with tab1:
-    st.subheader("🚀 2025 全資產收盤價訊號表")
-    all_symbols = {}
-    for cat in ASSET_LIST: all_symbols.update(ASSET_LIST[cat])
-    
-    radar_results = []
-    for sym, name in all_symbols.items():
-        scan_df, _ = get_signal_data(sym)
-        if not scan_df.empty:
-            curr = scan_df.iloc[-1]
-            prev = scan_df.iloc[-2]
+        if hist.empty:
+            st.error("找不到該股票數據，請檢查代碼是否正確。")
+        else:
+            # 2. 顯示基本面資訊儀表板
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("現價", f"{info.get('currentPrice', 'N/A')} {info.get('currency')}")
+            with col2:
+                roe = info.get('returnOnEquity', 0) * 100
+                st.metric("ROE", f"{roe:.2f}%")
+            with col3:
+                pe = info.get('trailingPE', 'N/A')
+                st.metric("本益比 (P/E)", f"{pe}")
+            with col4:
+                rev_growth = info.get('revenueGrowth', 0) * 100
+                st.metric("營收成長 (YoY)", f"{rev_growth:.2f}%")
+
+            # 3. 繪製互動式 K 線圖 (Candlestick)
+            st.subheader(f"📈 {info.get('shortName')} 股價走勢圖")
+            fig = go.Figure(data=[go.Candlestick(
+                x=hist.index,
+                open=hist['Open'],
+                high=hist['High'],
+                low=hist['Low'],
+                close=hist['Close'],
+                name="K線"
+            )])
             
-            sig_text = "⚪ 觀望"
-            if curr['Signal'] == "BUY": sig_text = "🟢 買入 (抄底)"
-            elif curr['Signal'] == "SELL": sig_text = "🔴 賣出 (獲利)"
-            elif curr['Final_Score'] < 15: sig_text = "🟡 準備買入"
-            elif curr['Final_Score'] > 85: sig_text = "🟠 準備賣出"
+            # 加入 200日均線 (MA200)
+            hist['MA200'] = hist['Close'].rolling(window=200).mean()
+            fig.add_trace(go.Scatter(x=hist.index, y=hist['MA200'], name="MA200", line=dict(color='orange', width=2)))
+            
+            fig.update_layout(xaxis_rangeslider_visible=False, height=600)
+            st.plotly_chart(fig, use_container_width=True)
 
-            radar_results.append({
-                "標的": name, "收盤價": f"{curr['Close']:.2f}",
-                "今日指令": sig_text, "檔位分數": round(curr['Final_Score'], 1), "昨日分數": round(prev['Final_Score'], 1)
-            })
-    st.table(pd.DataFrame(radar_results))
+            # 4. 分析師觀點 (邏輯判斷)
+            st.subheader("💡 系統綜合評估")
+            advice = []
+            if roe > 15: advice.append("✅ 高效獲利能力 (ROE > 15%)")
+            if info.get('currentPrice', 0) > info.get('twoHundredDayAverage', 0): advice.append("✅ 趨勢偏多 (現價高於 MA200)")
+            if rev_growth > 20: advice.append("✅ 強勁成長力道 (YoY > 20%)")
+            
+            if advice:
+                for item in advice:
+                    st.write(item)
+            else:
+                st.write("該標的目前未觸發任何核心選股邏輯，建議審慎觀察。")
 
-with tab2:
-    st.sidebar.header("🔍 標的選擇")
-    cat = st.sidebar.selectbox("類別", list(ASSET_LIST.keys()))
-    asset_name = st.sidebar.selectbox("標的", list(ASSET_LIST[cat].values()))
-    sid = [k for k, v in ASSET_LIST[cat].items() if v == asset_name][0]
-    
-    df, info = get_signal_data(sid)
-    if not df.empty:
-        st.subheader(f"📈 {asset_name} ({sid})：收盤價買賣訊號圖")
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        
-        # 價格主線
-        fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name="收盤價", line=dict(color="#FFFFFF", width=2)), secondary_y=False)
-        
-        # --- 修正處：將 opacity 移出 line 字典 ---
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df['Final_Score'], name="檔位線", 
-            line=dict(color="#00BFFF", width=1.5),
-            opacity=0.4 # 正確的寫法在這裡
-        ), secondary_y=True)
-        
-        # 標記買點與賣點 (釘在收盤價上)
-        buys = df[df['Signal'] == "BUY"]
-        sells = df[df['Signal'] == "SELL"]
-        fig.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers', marker=dict(color="#00FF00", size=12, symbol="triangle-up"), name="買"), secondary_y=False)
-        fig.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers', marker=dict(color="#FF0000", size=12, symbol="triangle-down"), name="賣"), secondary_y=False)
-        
-        fig.update_xaxes(range=[df.index[-1] - pd.Timedelta(days=90), df.index[-1]])
-        fig.update_layout(height=450, template="plotly_dark", showlegend=False, margin=dict(l=50, r=50, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"發生錯誤: {e}")
 
-        # --- 歷史明細分頁 ---
-        st.markdown("---")
-        st.subheader("🏛️ 歷史買賣指令明細")
-        full_h = df.tail(252).copy()
-        recs = []
-        for i in range(len(full_h)-1, -1, -1):
-            r = full_h.iloc[i]
-            if r['Signal'] != "HOLD":
-                recs.append({
-                    "日期": full_h.index[i].strftime('%Y/%m/%d'),
-                    "執行動作": "🟢 買入" if r['Signal'] == "BUY" else "🔴 賣出",
-                    "成交價": f"{r['Close']:.2f}",
-                    "檔位分數": f"{r['Final_Score']:.1f}"
-                })
-        
-        if 'p_idx_v6' not in st.session_state: st.session_state.p_idx_v6 = 0
-        max_p = max(0, (len(recs) - 1) // 10)
-        st.session_state.p_idx_v6 = min(st.session_state.p_idx_v6, max_p)
-
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c1:
-            if st.button("⬅️ 上一頁") and st.session_state.p_idx_v6 > 0: st.session_state.p_idx_v6 -= 1
-        with c3:
-            if st.button("下一頁 ➡️") and st.session_state.p_idx_v6 < max_p: st.session_state.p_idx_v6 += 1
-        
-        st.table(pd.DataFrame(recs[st.session_state.p_idx_v6*10 : st.session_state.p_idx_v6*10+10]))
+st.sidebar.markdown("### 開發筆記\n1. 輸入 `2330.TW` 查詢台積電\n2. 數據由 yfinance 提供\n3. 圖表支援滾輪縮放")
