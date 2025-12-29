@@ -7,8 +7,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # 1. 頁面配置
-st.set_page_config(page_title="台股波段全能掃描器 V12.0", layout="wide")
-st.title("🎯 台股優質成長股 - 大波段掃描系統")
+st.set_page_config(page_title="台股波段全能導航 V13.0", layout="wide")
+st.title("🛡️ 台股優質成長股 - 波段導航系統")
 
 # 2. 定義優質清單 (已排除循環股與國防股)
 MASTER_LIST = {
@@ -19,63 +19,79 @@ MASTER_LIST = {
     "優質金融/穩定內需": ["2881", "2882", "2886", "2891", "2884", "5880", "2912", "5904", "9941"]
 }
 
-# 3. 核心邏輯 (大波段抓取 + 族群性判定)
-def analyze_stock(df):
-    if len(df) < 100: return False, 0, 0
-    # SuperTrend 參數 (4.0 倍 ATR 以抓取 30%+ 漲幅)
-    multiplier = 4.0
+# 3. 核心運算函數
+def calculate_indicators(df, mult=4.0):
+    df = df.copy()
+    # SuperTrend
     hl2 = (df['High'] + df['Low']) / 2
     tr = np.maximum(df['High'] - df['Low'], np.maximum(abs(df['High'] - df['Close'].shift(1)), abs(df['Low'] - df['Close'].shift(1))))
     atr = tr.rolling(12).mean()
-    up_band = hl2 + (multiplier * atr)
-    
-    # 判斷趨勢轉強 (今日站上，昨日在下)
-    is_breakout = (df['Close'].iloc[-1] > up_band.iloc[-2]) and (df['Close'].iloc[-2] <= up_band.iloc[-3])
-    # 位階分數
-    score = (df['Close'].rolling(252).apply(lambda x: (x < x[-1]).mean() * 100)).iloc[-1]
-    # 量能與動能
-    vol_confirm = df['Volume'].iloc[-1] > (df['Volume'].rolling(10).mean().iloc[-1] * 1.1)
-    ma5_up = df['Close'].iloc[-1] > df['Close'].rolling(5).mean().iloc[-1]
-    
-    return (is_breakout and score < 75 and vol_confirm and ma5_up), score, df['Close'].iloc[-1]
+    df['UpBand'] = hl2 + (mult * atr)
+    df['DnBand'] = hl2 - (mult * atr)
+    df['Trend'] = True
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > df['UpBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('Trend')] = True
+        elif df['Close'].iloc[i] < df['DnBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('Trend')] = False
+        else:
+            df.iat[i, df.columns.get_loc('Trend')] = df['Trend'].iloc[i-1]
+            if df['Trend'].iloc[i] and df['DnBand'].iloc[i] < df['DnBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('DnBand')] = df['DnBand'].iloc[i-1]
+            if not df['Trend'].iloc[i] and df['UpBand'].iloc[i] > df['UpBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('UpBand')] = df['UpBand'].iloc[i-1]
+    df['ST_Line'] = np.where(df['Trend'], df['DnBand'], df['UpBand'])
+    # Score
+    df['Score'] = (df['Close'].rolling(252).apply(lambda x: (x < x[-1]).mean() * 100))
+    return df
 
-# 4. 掃描介面
-if st.button("🚀 執行全方位波段掃描"):
-    all_hits = []
-    group_hits_count = {g: 0 for g in MASTER_LIST.keys()}
-    st.write("🔍 正在掃描全市場優質標的...")
-    progress = st.progress(0)
-    
-    total_len = sum(len(v) for v in MASTER_LIST.values())
-    counter = 0
-    
-    for group, codes in MASTER_LIST.items():
-        for code in codes:
-            try:
-                df = yf.Ticker(f"{code}.TW").history(period="1y")
-                hit, score, price = analyze_stock(df)
-                if hit:
-                    all_hits.append({"族群": group, "代號": code, "股價": price, "位階分數": round(score, 1)})
-                    group_hits_count[group] += 1
-                counter += 1
-                progress.progress(counter / total_len)
-                time.sleep(0.1) # 略微等待，避免被封鎖
-            except: continue
+# --- 側邊欄：功能切換 ---
+mode = st.sidebar.radio("選擇功能", ["📊 全市場掃描", "🔍 個股深度診斷"])
+
+if mode == "📊 全市場掃描":
+    if st.button("啟動全方位掃描"):
+        all_hits = []
+        st.write("🔍 正在分析優質標的...")
+        progress = st.progress(0)
+        total = sum(len(v) for v in MASTER_LIST.values())
+        curr = 0
+        for group, codes in MASTER_LIST.items():
+            for code in codes:
+                try:
+                    df = yf.Ticker(f"{code}.TW").history(period="1y")
+                    df = calculate_indicators(df)
+                    # 買入訊號條件
+                    hit = (df['Trend'].iloc[-1] and not df['Trend'].iloc[-2] and df['Score'].iloc[-1] < 75)
+                    if hit:
+                        all_hits.append({"族群": group, "代號": code, "股價": round(df['Close'].iloc[-1], 1), "位階": round(df['Score'].iloc[-1], 1)})
+                except: pass
+                curr += 1
+                progress.progress(curr/total)
+        if all_hits:
+            st.success(f"發現 {len(all_hits)} 檔種子標的")
+            st.table(pd.DataFrame(all_hits))
+        else:
+            st.info("目前尚無符合起漲條件標的。")
+
+else:
+    stock_code = st.sidebar.text_input("輸入台股代號 (如: 2330)", value="2330")
+    if st.sidebar.button("開始診斷"):
+        data = yf.Ticker(f"{stock_code}.TW").history(period="2y")
+        if not data.empty:
+            df = calculate_indicators(data).tail(250)
             
-    if all_hits:
-        st.success(f"✅ 掃描完成！發現 {len(all_hits)} 檔正要起漲的波段種子。")
-        res_df = pd.DataFrame(all_hits)
-        st.table(res_df)
-        
-        # 族群共振警告
-        for g, count in group_hits_count.items():
-            if count >= 2:
-                st.warning(f"🔥 【{g}】出現集體轉強訊號！這是抓到 30% 以上漲幅的關鍵時機。")
-    else:
-        st.info("目前清單標的尚未出現符合『低位階 + 剛站上趨勢線』的買點。")
-
-st.markdown("---")
-st.subheader("💡 使用者指南")
-st.write("1. **耐心**：本系統設計初衷是抓 30% 以上漲幅，因此訊號不會天天有。")
-st.write("2. **防守**：買入後，若收盤跌破 SuperTrend 防禦線（約 $4.0 \times ATR$ 距離）則嚴格出場。")
-st.write("3. **過濾**：已為您過濾掉景氣循環股，降低因報價波動導致波段腰斬的風險。")
+            # 建立圖表
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+            # K線
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
+            # SuperTrend 線 (變色處理)
+            line_color = ['#00FFCC' if t else '#FF4444' for t in df['Trend']]
+            fig.add_trace(go.Scatter(x=df.index, y=df['ST_Line'], name="波段防禦線", line=dict(color='cyan', width=2, dash='dot')), row=1, col=1)
+            
+            # 成交量
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color='rgba(100,100,100,0.5)'), row=2, col=1)
+            
+            fig.update_layout(height=800, template="plotly_dark", hovermode="x unified")
+            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 診斷文字
+            status = "🚀 多頭波段中" if df['Trend'].iloc[-1] else "🛑 空頭整理中"
+            st.metric("趨勢狀態", status)
+            st.write(f"💡 **操作建議**：只要收盤沒跌破 **{df['ST_Line'].iloc[-1]:.1f}**，30% 的波段目標就繼續持有。")
