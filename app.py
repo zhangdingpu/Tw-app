@@ -1,53 +1,61 @@
+import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# 1. 抓取台積電數據
+# 設定網頁標題
+st.set_page_config(page_title="飆股篩選器-2330測試", layout="wide")
+
+st.title("🚀 飆股自動篩選器 - 2330 走勢分析")
+
+# 1. 抓取數據 (台積電 2330)
+@st.cache_data # 增加快取，避免重複抓取
+def load_data(ticker):
+    df = yf.download(ticker, period="1y")
+    return df
+
 ticker = "2330.TW"
-df = yf.download(ticker, start="2024-07-01")
+data = load_data(ticker)
 
-# 2. 建立子圖：第一列放 K線，第二列放成交量
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                    vertical_spacing=0.05, 
-                    row_heights=[0.7, 0.3])
+if not data.empty:
+    # 2. 建立繪圖
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.05, 
+                        row_heights=[0.7, 0.3])
 
-# 3. 繪製 K線圖 (Candlestick)
-fig.add_trace(go.Candlestick(
-    x=df.index,
-    open=df['Open'],
-    high=df['High'],
-    low=df['Low'],
-    close=df['Close'],
-    name="TSMC",
-    increasing_line_color='#ef5350',  # 漲：亮紅
-    decreasing_line_color='#26a69a',  # 跌：亮綠
-    increasing_fillcolor='#ef5350',
-    decreasing_fillcolor='#26a69a'
-), row=1, col=1)
+    # K線圖
+    fig.add_trace(go.Candlestick(
+        x=data.index,
+        open=data['Open'],
+        high=data['High'],
+        low=data['Low'],
+        close=data['Close'],
+        name="收盤價",
+        increasing_line_color='#ef5350', # 漲紅
+        decreasing_line_color='#26a69a'  # 跌綠
+    ), row=1, col=1)
 
-# 4. 繪製成交量 (Volume)
-# 根據漲跌設定成交量顏色
-colors = ['#ef5350' if close >= open else '#26a69a' 
-          for open, close in zip(df['Open'], df['Close'])]
+    # 成交量
+    fig.add_trace(go.Bar(
+        x=data.index,
+        y=data['Volume'],
+        name="成交量",
+        marker_color='gray'
+    ), row=2, col=1)
 
-fig.add_trace(go.Bar(
-    x=df.index,
-    y=df['Volume'],
-    marker_color=colors,
-    name="Volume"
-), row=2, col=1)
+    # 樣式設定 (比照截圖的黑色主題)
+    fig.update_layout(
+        template='plotly_dark',
+        xaxis_rangeslider_visible=False,
+        height=600,
+        margin=dict(l=10, r=10, t=30, b=10)
+    )
 
-# 5. 比照你截圖的黑色主題美化
-fig.update_layout(
-    title=f"2330 台積電 專業技術分析圖",
-    template='plotly_dark', # 深色背景
-    xaxis_rangeslider_visible=False, # 隱藏下方滑桿以更像截圖
-    showlegend=False,
-    height=800,
-    paper_bgcolor='#131722', # 深藍黑背景色
-    plot_bgcolor='#131722',
-    yaxis=dict(gridcolor='#2a2e39'),
-    xaxis=dict(gridcolor='#2a2e39')
-)
-
-fig.show()
+    # 3. 顯示圖表
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 顯示數據表格供確認
+    st.subheader("最新數據摘要")
+    st.write(data.tail())
+else:
+    st.error("找不到數據，請檢查網路連線或代碼。")
