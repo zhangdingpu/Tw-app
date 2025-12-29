@@ -2,89 +2,99 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.signal import argrelextrema
-from fake_useragent import UserAgent
 
-# 1. 初始化與頁面配置
-st.set_page_config(page_title="VCP 專業導航器", layout="wide")
-ua = UserAgent()
+# 1. 頁面設定
+st.set_page_config(page_title="動能大戶導航器", layout="wide")
+st.title("🚀 大戶動能起漲診斷系統 (60MA + ADX + SuperTrend)")
 
-# 2. 抗封鎖抓取函數 (Cache 提高到 1 小時以節省額度)
+# 2. 抗封鎖抓取
 @st.cache_data(ttl=3600)
-def fetch_data_robust(code):
-    try:
-        # 使用隨機 User-Agent
-        headers = {'User-Agent': ua.random}
-        
-        # 建立一個持久化的 Session 有助於減少被鎖機率
-        session = None # 若有需要可加入 requests session
-        
-        ticker = yf.Ticker(f"{code}.TW")
-        df = ticker.history(period="1y")
-        
-        if df.empty:
-            ticker = yf.Ticker(f"{code}.TWO")
-            df = ticker.history(period="1y")
-            
-        return df
-    except Exception as e:
-        return pd.DataFrame()
+def fetch_data(code):
+    for suffix in [".TW", ".TWO"]:
+        try:
+            df = yf.Ticker(f"{code}{suffix}").history(period="1y")
+            if not df.empty: return df
+        except: continue
+    return pd.DataFrame()
 
-# --- UI 介面 ---
-st.title("🛡️ VCP 形態與窒息量診斷")
-st.markdown("專注於識別 **30% 漲幅** 的波動收縮型態。")
-
-stock_input = st.sidebar.text_input("輸入台股代號 (如: 2330, 3131)", value="")
-
-if stock_input:
-    df_raw = fetch_data_robust(stock_input)
+# 3. 核心邏輯運算
+def calculate_advanced_signals(df):
+    # --- 指標計算 ---
+    # A. 方向判斷：60MA 及其斜率 (取 3 天的差值)
+    df['MA60'] = ta.sma(df['Close'], length=60)
+    df['MA60_Slope'] = df['MA60'].diff(3) 
     
-    if not df_raw.empty:
-        df = df_raw.tail(150).copy()
-        
-        # 指標計算
-        df['MA50'] = df['Close'].rolling(50).mean()
-        df['MA200'] = df['Close'].rolling(200).mean()
-        df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        
-        # VCP 關鍵點識別
-        peak_idx = argrelextrema(df['High'].values, np.greater_equal, order=8)[0]
-        peaks = df.iloc[peak_idx]
+    # B. 動能過濾：ADX (14)
+    adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+    df = pd.concat([df, adx_df], axis=1) # 包含 ADX_14, DMP_14, DMN_14
+    
+    # C. 進場點：SuperTrend (10, 4.0)
+    st_df = ta.supertrend(df['High'], df['Low'], df['Close'], length=10, multiplier=4.0)
+    df = pd.concat([df, st_df], axis=1) # 包含 SUPERT_10_4.0, SUPERTd_10_4.0
+    
+    # D. 安全檢查：RSI (14)
+    df['RSI'] = ta.rsi(df['Close'], length=14)
+    
+    # E. 力道確認：成交量
+    df['Vol_MA5'] = df['Volume'].rolling(5).mean()
+    
+    return df
 
-        # 繪製主圖表
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.05)
+# --- UI 查詢 ---
+stock_code = st.sidebar.text_input("輸入台股代號", value="2330")
 
-        # 主圖：K線與 VCP 邊界
+if stock_input := stock_code:
+    raw_df = fetch_data(stock_input)
+    if not raw_df.empty:
+        df = calculate_advanced_signals(raw_df).tail(150)
+        
+        # --- 判斷 5 大核心過濾條件 (做多) ---
+        c1 = df['MA60_Slope'].iloc[-1] > 0               # 60MA 斜率向上
+        c2 = df['ADX_14'].iloc[-1] > 25                 # ADX 動能強勁
+        c3 = (df['SUPERTd_10_4.0'].iloc[-1] == 1) and (df['SUPERTd_10_4.0'].iloc[-2] == -1) # SuperTrend 轉綠首日
+        c4 = df['Volume'].iloc[-1] > (df['Vol_MA5'].iloc[-1] * 1.5) # 量增 1.5 倍
+        c5 = df['RSI'].iloc[-1] < 75                    # 未過熱
+        
+        # --- 繪圖區 ---
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                           row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
+        
+        # 主圖: K線 + 60MA + SuperTrend
         fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA50'], name="50MA", line=dict(color='orange', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name="60MA (趨勢線)", line=dict(color='yellow', width=2.5)), row=1, col=1)
         
-        if len(peaks) >= 2:
-            # 畫出收縮連線
-            fig.add_trace(go.Scatter(x=peaks.index, y=peaks['High'], mode='lines+markers', name="收縮邊界", line=dict(color='yellow', dash='dash')), row=1, col=1)
-            # 畫出 Pivot 線
-            pivot = peaks['High'].iloc[-1]
-            fig.add_hline(y=pivot, line_dash="dot", line_color="lime", line_width=3, annotation_text=f"突破關鍵: {pivot}", row=1, col=1)
+        # SuperTrend 背景顏色或線條
+        st_line = df['SUPERT_10_4.0']
+        st_color = ['lime' if d == 1 else 'red' for d in df['SUPERTd_10_4.0']]
+        fig.add_trace(go.Scatter(x=df.index, y=st_line, name="SuperTrend", line=dict(color='rgba(0,255,0,0.5)', dash='dot')), row=1, col=1)
 
-        # 副圖：成交量與窒息量 (紫色)
-        vol_colors = ['#BF40BF' if v < vm * 0.6 else '#26a69a' if c >= o else '#ef5350' 
-                      for v, vm, c, o in zip(df['Volume'], df['Vol_MA20'], df['Close'], df['Open'])]
+        # ADX 能量圖
+        fig.add_trace(go.Scatter(x=df.index, y=df['ADX_14'], name="ADX 動能", line=dict(color='cyan', width=2)), row=2, col=1)
+        fig.add_hline(y=25, line_dash="dash", line_color="white", row=2, col=1)
+
+        # 成交量與 RSI
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color='gray'), row=3, col=1)
         
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color=vol_colors), row=2, col=1)
-
-        fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False, hovermode="x unified")
+        fig.update_layout(height=900, template="plotly_dark", xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
+        
+        # --- 儀表板診斷 ---
+        st.subheader("📊 關鍵過濾清單 (做多建議)")
+        cols = st.columns(5)
+        cols[0].metric("60MA 斜率向上", "✅" if c1 else "❌")
+        cols[1].metric("ADX > 25", f"{df['ADX_14'].iloc[-1]:.1f}", delta="動能足" if c2 else "低迷")
+        cols[2].metric("SuperTrend 轉向", "🔥 轉綠" if c3 else "維持")
+        cols[3].metric("量能爆發", f"{df['Volume'].iloc[-1]/df['Vol_MA5'].iloc[-1]:.1f}x", delta="有大戶" if c4 else "一般")
+        cols[4].metric("RSI 安全區", f"{df['RSI'].iloc[-1]:.1f}", delta="未過熱" if c5 else "過熱")
 
-        # 診斷總結
-        range_15 = (df['High'].tail(15).max() - df['Low'].tail(15).min()) / df['Low'].tail(15).min()
-        st.subheader("📝 VCP 形態診斷")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("15日收縮率", f"{range_15:.1%}", delta="符合收縮" if range_15 < 0.1 else "波動尚大")
-        with c2:
-            is_quiet = df['Volume'].iloc[-1] < df['Vol_MA20'].iloc[-1] * 0.7
-            st.metric("窒息量檢測", "出現訊號" if is_quiet else "量能尚多")
+        if c1 and c2 and c3 and c4 and c5:
+            st.balloons()
+            st.success("🎯 五星全亮！符合大戶點火起漲條件，預期波段獲利目標 30%！")
+        elif c3:
+            st.warning("⚠️ SuperTrend 雖轉向，但其他動能或趨勢條件未全數達成，建議分批佈局。")
 
     else:
-        st.error("⚠️ 抓取數據失敗。這可能是因為 Yahoo Finance 流量限制。請等候幾分鐘再試，或嘗試輸入不同的代號。")
+        st.error("查無數據，請稍後再試。")
