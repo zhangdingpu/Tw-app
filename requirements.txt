@@ -6,3 +6,5 @@ pandas_ta
 plotly
 mplfinance
 matplotlib
+scipy
+streamlit
