@@ -4,93 +4,143 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from FinMind.data import DataLoader
+from datetime import datetime, timedelta
 
-# --- 1. 初始化與數據抓取 ---
-st.set_page_config(layout="wide", page_title="飆股起漲監控 Pro")
+# --- 1. 初始化與配置 ---
+st.set_page_config(layout="wide", page_title="飆股戰情室 Pro")
 dl = DataLoader()
 
-@st.cache_data(ttl=3600)  # 緩存一小時，避免重複請求
-def get_stock_data(stock_id, start_date):
-    # 抓取股價
-    df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
-    # 抓取三大法人籌碼
-    inst = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
-    # 抓取大戶持股 (每週更新)
-    holders = dl.taiwan_stock_holding_shares_per(stock_id=stock_id, start_date=start_date)
-    return df, inst, holders
+# 自定義 CSS 讓介面更專業
+st.markdown("""
+    <style>
+    .stMetric { background-color: #f0f2f6; padding: 15px; border-radius: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- 2. 核心邏輯：判斷起漲點與狀態 ---
-def analyze_stock(df, inst):
-    # 計算技術指標
-    df['MA20'] = ta.sma(df['close'], length=20)
-    df['Vol_MA20'] = ta.sma(df['Volume'], length=20)
+# --- 2. 核心數據處理函數 (加強版) ---
+@st.cache_data(ttl=3600)
+def fetch_full_data(stock_id, start_date):
+    try:
+        # A. 股價資料
+        df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
+        if df.empty or len(df) < 20: return None
+        
+        # B. 法人資料
+        inst = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
+        
+        # C. 大戶持股 (每週更新)
+        holders = dl.taiwan_stock_holding_shares_per(stock_id=stock_id, start_date=start_date)
+        
+        # 資料清洗與計算
+        df['MA20'] = ta.sma(df['close'], length=20)
+        df['Vol_MA20'] = ta.sma(df['Volume'], length=20)
+        
+        return {"price": df, "inst": inst, "holders": holders}
+    except Exception as e:
+        return None
+
+def analyze_strategy(data):
+    df = data['price']
+    inst = data['inst']
     
-    # 最近一日數據
+    if df.empty: return "觀望", 0
+    
     latest = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # 判斷條件
-    price_break = latest['close'] > latest['MA20'] and latest['close'] > prev['close'] * 1.03
-    vol_surge = latest['Volume'] > latest['Vol_MA20'] * 1.5
-    inst_buy = inst.tail(3)['buy'].sum() > inst.tail(3)['sell'].sum() # 近三天法人淨買
+    # 起漲邏輯：1. 收盤突破20MA 2. 漲幅 > 2% 3. 量增 1.5倍 4. 近三日法人買超
+    price_cond = latest['close'] > latest['MA20'] and latest['close'] > prev['close'] * 1.02
+    vol_cond = latest['Volume'] > latest['Vol_MA20'] * 1.5
     
-    if price_break and vol_surge and inst_buy:
-        return "🔴 強力買入 (起漲點)", "Inverse"
-    elif latest['close'] < latest['MA20']:
-        return "🟢 賣出/觀望", "Normal"
+    # 安全檢查法人資料
+    inst_cond = False
+    if not inst.empty:
+        recent_inst = inst.tail(3)
+        inst_cond = (recent_inst['buy'].sum() - recent_inst['sell'].sum()) > 0
+    
+    score = 0
+    if price_cond: score += 40
+    if vol_cond: score += 30
+    if inst_cond: score += 30
+    
+    if score >= 70: return "🔴 強力買入", score
+    elif latest['close'] < latest['MA20']: return "🟢 賣出觀望", score
+    else: return "🟡 持有觀望", score
+
+# --- 3. 側邊欄與導覽 ---
+st.sidebar.title("🚀 飆股監控選單")
+stock_id = st.sidebar.text_input("輸入股票代碼", value="2330")
+lookback_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+# --- 4. 主介面邏輯 ---
+data = fetch_full_data(stock_id, lookback_date)
+
+if data:
+    status, score = analyze_strategy(data)
+    
+    # 頂部儀表板
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("當前訊號", status)
+    col2.metric("起漲強度評分", f"{score} 分")
+    
+    # 回測邏輯：計算過去一年符合訊號後的 5 日漲幅勝率
+    df_bt = data['price']
+    signals = (df_bt['close'] > df_bt['MA20']) & (df_bt['Volume'] > df_bt['Vol_MA20'] * 1.5)
+    total_signals = signals.sum()
+    wins = 0
+    if total_signals > 0:
+        for i in df_bt[signals].index:
+            if i + 5 < len(df_bt):
+                if df_bt.iloc[i+5]['close'] > df_bt.iloc[i]['close']: wins += 1
+        win_rate = round((wins / total_signals) * 100, 1)
+        col3.metric("歷史起漲勝率 (5日)", f"{win_rate}%")
     else:
-        return "🟡 持有/盤整", "Neutral"
+        col3.metric("歷史起漲勝率 (5日)", "N/A")
+    
+    col4.metric("法人近三日力道", "偏多" if score > 50 else "偏空")
 
-# --- 3. UI 介面設計 ---
-st.sidebar.title("🛠 參數設定")
-target_stock = st.sidebar.text_input("輸入台股代碼", "2330")
-start_date = st.sidebar.date_input("起始日期", value=pd.to_datetime("2023-01-01"))
+    # --- 繪製專業圖表 ---
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                        row_heights=[0.5, 0.25, 0.25],
+                        subplot_titles=("K線與均線", "大戶持股比 (400張以上)", "法人買賣力道"))
 
-if target_stock:
-    try:
-        df, inst, holders = get_stock_data(target_stock, start_date.strftime('%Y-%m-%d'))
-        
-        # 狀態儀表板
-        status, trend = analyze_stock(df, inst)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("當前操盤建議", status)
-        c2.metric("法人近三日動向", f"{inst.tail(3)['diff'].sum():,.0f} 股")
-        c3.metric("起漲勝率 (歷史模擬)", "72%") # 模擬回測值
+    # 主圖
+    fig.add_trace(go.Candlestick(x=df_bt['date'], open=df_bt['open'], high=df_bt['high'], 
+                                 low=df_bt['low'], close=df_bt['close'], name='K線'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_bt['date'], y=df_bt['MA20'], name='20MA', line=dict(color='yellow')), row=1, col=1)
 
-        # --- 4. 繪製專業圖表 (大戶 vs 散戶) ---
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.03, row_heights=[0.5, 0.25, 0.25],
-                            subplot_titles=("K線與均線", "大戶持股比 (400張以上)", "法人買賣超"))
+    # 大戶圖 (安全檢查)
+    if not data['holders'].empty:
+        fig.add_trace(go.Scatter(x=data['holders']['date'], y=data['holders']['percent'], name='大戶持股%', line=dict(color='cyan')), row=2, col=1)
+    
+    # 法人圖
+    if not data['inst'].empty:
+        inst_df = data['inst']
+        colors = ['red' if x > 0 else 'green' for x in (inst_df['buy'] - inst_df['sell'])]
+        fig.add_trace(go.Bar(x=inst_df['date'], y=(inst_df['buy'] - inst_df['sell']), marker_color=colors, name='法人淨買'), row=3, col=1)
 
-        # K線
-        fig.add_trace(go.Candlestick(x=df['date'], open=df['open'], high=df['high'], 
-                                     low=df['low'], close=df['close'], name='K線'), row=1, col=1)
-        
-        # 大戶持股比 (模擬呈現籌碼集中度)
-        fig.add_trace(go.Scatter(x=holders['date'], y=holders['percent'], name='大戶持股%'), row=2, col=1)
-        
-        # 法人買賣超柱狀圖
-        colors = ['red' if x > 0 else 'green' for x in inst['diff']]
-        fig.add_trace(go.Bar(x=inst['date'], y=inst['diff'], marker_color=colors, name='法人買賣'), row=3, col=1)
+    fig.update_layout(height=800, template='plotly_dark', showlegend=False, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
 
-        fig.update_layout(height=800, template='plotly_dark', showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.error("⚠️ 無法取得資料，請確認 API 連線或股票代碼是否正確。")
 
-        # --- 5. 回測模組展示 ---
-        st.subheader("📊 歷史起漲信號勝率統計")
-        backtest_results = pd.DataFrame({
-            '訊號日期': df['date'].tail(5),
-            '觸發價格': df['close'].tail(5),
-            '5日後漲幅': ['+5.2%', '-1.2%', '+8.4%', '+3.1%', '+2.2%'],
-            '結果': ['✅ 成功', '❌ 失敗', '✅ 成功', '✅ 成功', '✅ 成功']
-        })
-        st.table(backtest_results)
-
-    except Exception as e:
-        st.error(f"數據抓取失敗，請檢查代碼或 API 限制。錯誤: {e}")
-
-# --- 6. 全市場掃描按鈕 (功能架構) ---
-if st.sidebar.button("⚡ 執行全市場起漲掃描"):
-    st.info("正在掃描全台股 1700+ 檔標的，請稍候...")
-    # 這裡可放入迴圈跑多檔股票的分析邏輯
-    st.success("掃描完成！今日推薦標的：2317, 2454, 3037 (範例)")
+# --- 5. 全市場掃描功能 (示範) ---
+if st.sidebar.button("🔍 執行全市場起漲點掃描"):
+    st.write("### 🎯 今日潛力起漲標的 (以熱門股為例)")
+    sample_list = ['2330', '2317', '2454', '2303', '2603', '3037', '2382', '3231']
+    hit_list = []
+    
+    progress_bar = st.progress(0)
+    for idx, s_id in enumerate(sample_list):
+        s_data = fetch_full_data(s_id, (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d'))
+        if s_data:
+            s_status, _ = analyze_strategy(s_data)
+            if "🔴" in s_status:
+                hit_list.append(s_id)
+        progress_bar.progress((idx + 1) / len(sample_list))
+    
+    if hit_list:
+        st.success(f"掃描完成！符合起漲點標的：{', '.join(hit_list)}")
+    else:
+        st.info("今日暫無符合「強力起漲」之標的。")
