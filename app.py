@@ -1,100 +1,102 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from fake_useragent import UserAgent
 
-# 1. 頁面設定
-st.set_page_config(page_title="動能大戶導航器", layout="wide")
-st.title("🚀 大戶動能起漲診斷系統 (60MA + ADX + SuperTrend)")
+st.set_page_config(page_title="AI 趨勢評分導航器", layout="wide")
+ua = UserAgent()
 
-# 2. 抗封鎖抓取
 @st.cache_data(ttl=3600)
 def fetch_data(code):
-    for suffix in [".TW", ".TWO"]:
-        try:
-            df = yf.Ticker(f"{code}{suffix}").history(period="1y")
-            if not df.empty: return df
-        except: continue
-    return pd.DataFrame()
+    try:
+        headers = {'User-Agent': ua.random}
+        ticker = yf.Ticker(f"{code}.TW")
+        df = ticker.history(period="1y")
+        if df.empty:
+            df = yf.Ticker(f"{code}.TWO").history(period="1y")
+        return df
+    except: return pd.DataFrame()
 
-# 3. 核心邏輯運算
-def calculate_advanced_signals(df):
-    # --- 指標計算 ---
-    # A. 方向判斷：60MA 及其斜率 (取 3 天的差值)
-    df['MA60'] = ta.sma(df['Close'], length=60)
-    df['MA60_Slope'] = df['MA60'].diff(3) 
-    
-    # B. 動能過濾：ADX (14)
-    adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-    df = pd.concat([df, adx_df], axis=1) # 包含 ADX_14, DMP_14, DMN_14
-    
-    # C. 進場點：SuperTrend (10, 4.0)
-    st_df = ta.supertrend(df['High'], df['Low'], df['Close'], length=10, multiplier=4.0)
-    df = pd.concat([df, st_df], axis=1) # 包含 SUPERT_10_4.0, SUPERTd_10_4.0
-    
-    # D. 安全檢查：RSI (14)
-    df['RSI'] = ta.rsi(df['Close'], length=14)
-    
-    # E. 力道確認：成交量
-    df['Vol_MA5'] = df['Volume'].rolling(5).mean()
-    
-    return df
+def get_rating(score, st_trend):
+    if st_trend == 1: # SuperTrend 多頭
+        if score >= 85: return "🔥 強烈買入 (Strong Buy)", "success"
+        if score >= 60: return "✅ 買入 (Buy)", "info"
+        return "⏳ 觀望 (Wait/Hold)", "warning"
+    else: # SuperTrend 空頭
+        if score <= 20: return "💀 強烈賣出 (Strong Sell)", "error"
+        if score <= 45: return "⚠️ 賣出 (Sell)", "error"
+        return "⏳ 觀望 (Wait/Hold)", "warning"
 
-# --- UI 查詢 ---
-stock_code = st.sidebar.text_input("輸入台股代號", value="2330")
+# --- UI ---
+st.title("🤖 AI 綜合量化評分系統")
+code = st.sidebar.text_input("輸入台股代號", "2330")
 
-if stock_input := stock_code:
-    raw_df = fetch_data(stock_input)
+if code:
+    raw_df = fetch_data(code)
     if not raw_df.empty:
-        df = calculate_advanced_signals(raw_df).tail(150)
+        df = raw_df.copy()
+        # 1. 指標計算
+        df['MA60'] = ta.sma(df['Close'], length=60)
+        df['MA60_Slope'] = df['MA60'].diff(3)
+        adx = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+        st_data = ta.supertrend(df['High'], df['Low'], df['Close'], length=10, multiplier=4.0)
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        df['Vol_MA5'] = df['Volume'].rolling(5).mean()
         
-        # --- 判斷 5 大核心過濾條件 (做多) ---
-        c1 = df['MA60_Slope'].iloc[-1] > 0               # 60MA 斜率向上
-        c2 = df['ADX_14'].iloc[-1] > 25                 # ADX 動能強勁
-        c3 = (df['SUPERTd_10_4.0'].iloc[-1] == 1) and (df['SUPERTd_10_4.0'].iloc[-2] == -1) # SuperTrend 轉綠首日
-        c4 = df['Volume'].iloc[-1] > (df['Vol_MA5'].iloc[-1] * 1.5) # 量增 1.5 倍
-        c5 = df['RSI'].iloc[-1] < 75                    # 未過熱
+        df = pd.concat([df, adx, st_data], axis=1)
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # 2. AI 評分邏輯 (總分 100)
+        score = 0
+        if last['MA60_Slope'] > 0: score += 20 # 趨勢向上
+        if last['ADX_14'] > 25: score += 20    # 動能足夠
+        if last['SUPERTd_10_4.0'] == 1: 
+            score += 30                        # 多頭波段中
+            if prev['SUPERTd_10_4.0'] == -1: score += 10 # 轉折首日加分
+        if last['Volume'] > (last['Vol_MA5'] * 1.5): score += 15 # 大戶點火
+        if 40 < last['RSI'] < 75: score += 5   # 健康區間
+
+        rating, status_color = get_rating(score, last['SUPERTd_10_4.0'])
+
+        # --- 顯示區 ---
+        st.subheader(f"📊 {code} 綜合分析報告")
         
-        # --- 繪圖區 ---
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                           row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
-        
-        # 主圖: K線 + 60MA + SuperTrend
+        if status_color == "success": st.success(f"評級：{rating}")
+        elif status_color == "info": st.info(f"評級：{rating}")
+        elif status_color == "warning": st.warning(f"評級：{rating}")
+        else: st.error(f"評級：{rating}")
+
+        # 指標儀表板
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("AI 總分", f"{score} 分")
+        c2.metric("ADX 動能", f"{last['ADX_14']:.1f}")
+        c3.metric("RSI 指數", f"{last['RSI']:.1f}")
+        c4.metric("量能倍率", f"{last['Volume']/last['Vol_MA5']:.1f}x")
+        c5.metric("60MA 斜率", "↑" if last['MA60_Slope'] > 0 else "↓")
+
+        # 圖表
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
         fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name="60MA (趨勢線)", line=dict(color='yellow', width=2.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name="60MA", line=dict(color='yellow')), row=1, col=1)
         
-        # SuperTrend 背景顏色或線條
         st_line = df['SUPERT_10_4.0']
-        st_color = ['lime' if d == 1 else 'red' for d in df['SUPERTd_10_4.0']]
-        fig.add_trace(go.Scatter(x=df.index, y=st_line, name="SuperTrend", line=dict(color='rgba(0,255,0,0.5)', dash='dot')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=st_line, name="SuperTrend", line=dict(color='cyan', dash='dot')), row=1, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color='gray'), row=2, col=1)
 
-        # ADX 能量圖
-        fig.add_trace(go.Scatter(x=df.index, y=df['ADX_14'], name="ADX 動能", line=dict(color='cyan', width=2)), row=2, col=1)
-        fig.add_hline(y=25, line_dash="dash", line_color="white", row=2, col=1)
-
-        # 成交量與 RSI
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color='gray'), row=3, col=1)
-        
-        fig.update_layout(height=900, template="plotly_dark", xaxis_rangeslider_visible=False)
+        fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
-        
-        # --- 儀表板診斷 ---
-        st.subheader("📊 關鍵過濾清單 (做多建議)")
-        cols = st.columns(5)
-        cols[0].metric("60MA 斜率向上", "✅" if c1 else "❌")
-        cols[1].metric("ADX > 25", f"{df['ADX_14'].iloc[-1]:.1f}", delta="動能足" if c2 else "低迷")
-        cols[2].metric("SuperTrend 轉向", "🔥 轉綠" if c3 else "維持")
-        cols[3].metric("量能爆發", f"{df['Volume'].iloc[-1]/df['Vol_MA5'].iloc[-1]:.1f}x", delta="有大戶" if c4 else "一般")
-        cols[4].metric("RSI 安全區", f"{df['RSI'].iloc[-1]:.1f}", delta="未過熱" if c5 else "過熱")
 
-        if c1 and c2 and c3 and c4 and c5:
-            st.balloons()
-            st.success("🎯 五星全亮！符合大戶點火起漲條件，預期波段獲利目標 30%！")
-        elif c3:
-            st.warning("⚠️ SuperTrend 雖轉向，但其他動能或趨勢條件未全數達成，建議分批佈局。")
-
-    else:
-        st.error("查無數據，請稍後再試。")
+        # 3. 操作建議
+        st.write("### 📝 AI 決策建議")
+        if rating.startswith("🔥 強烈買入"):
+            st.write("📌 **分析**：目前處於強勢起漲點。季線向上且 ADX 顯示趨勢極強，伴隨成交量放大，是標準的 **30% 波段起手式**。")
+        elif rating.startswith("✅ 買入"):
+            st.write("📌 **分析**：趨勢已轉多，但動能或量能稍欠臨門一腳，建議分批佈局。")
+        elif rating.startswith("💀 強烈賣出"):
+            st.write("📌 **分析**：SuperTrend 已轉紅且 60MA 斜率向下，建議全面撤退，保護本金。")
+        else:
+            st.write("📌 **分析**：目前指標互有矛盾，或處於無趨勢狀態，建議觀望直到 SuperTrend 變色或 ADX 轉強。")
