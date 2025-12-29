@@ -2,79 +2,67 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import time
 
-# 1. 頁面風格優化
-st.set_page_config(page_title="量化選股 V8.5 - 終極波段版", layout="wide")
-st.markdown("""<style>.main { background-color: #000000; } h1,h2,h3 { color: #00FFCC !important; }</style>""", unsafe_allow_html=True)
+# 1. 頁面設定
+st.set_page_config(page_title="台股波段成長掃描器", layout="wide")
+st.title("🎯 台股大波段起漲掃描器 (避開景氣循環/國防)")
 
-# 2. 穩定抓取數據 (含快取)
-@st.cache_data(ttl=3600)
-def fetch_data(code):
-    for suffix in [".TW", ".TWO"]:
-        ticker = yf.Ticker(f"{code}{suffix}")
-        hist = ticker.history(period="3y")
-        if not hist.empty: return hist, ticker.info
-    return None, None
+# 2. 核心掃描與大波段邏輯 (30%+ 潛力版本)
+def analyze_wave(df):
+    if len(df) < 100: return False, 0, 0
+    
+    # SuperTrend 大波段設定
+    multiplier = 4.0
+    period = 12
+    hl2 = (df['High'] + df['Low']) / 2
+    df['TR'] = np.maximum(df['High'] - df['Low'], np.maximum(abs(df['High'] - df['Close'].shift(1)), abs(df['Low'] - df['Close'].shift(1))))
+    df['ATR'] = df['TR'].rolling(period).mean()
+    df['UpBand'] = hl2 + (multiplier * df['ATR'])
+    
+    # 判斷趨勢轉強 (站上防禦線)
+    is_breakout = (df['Close'].iloc[-1] > df['UpBand'].iloc[-2]) and (df['Close'].iloc[-2] <= df['UpBand'].iloc[-3])
+    
+    # 位階分數 (低於 60 分確保利潤空間)
+    score = (df['Close'].rolling(252).apply(lambda x: (x < x[-1]).mean() * 100)).iloc[-1]
+    
+    # 量能確認 (量增 1.1 倍即可)
+    vol_confirm = df['Volume'].iloc[-1] > (df['Volume'].rolling(10).mean().iloc[-1] * 1.1)
+    
+    # 價格位置 (距離低點不能漲超過 15%，否則不算起漲)
+    low_20 = df['Low'].tail(20).min()
+    too_high = df['Close'].iloc[-1] > (low_20 * 1.15)
+    
+    return (is_breakout and score < 60 and vol_confirm and not too_high), score, df['Close'].iloc[-1]
 
-# 3. 核心邏輯整合：慣性斜率 + 靈敏成交量
-def calculate_ultimate_system(df):
-    df = df.copy()
-    # 使用 WMA 提升貼合度 (減少落後)
-    w = np.arange(1, 21)
-    df['Trend_Line'] = df['Close'].rolling(20).apply(lambda x: np.dot(x, w)/w.sum(), raw=True)
-    
-    # 斜率：只需 1 日轉正即反應
-    df['Slope'] = df['Trend_Line'].diff(1)
-    
-    # 檔位分數 (放寬至 75 分)
-    def p(s): return s.rolling(252, min_periods=10).apply(lambda x: (x < x[-1]).mean() * 100)
-    df['Score'] = (p(df['Close']) * 0.5) + (p(df['Close'].diff().rolling(10).mean()) * 0.5)
-    
-    # 成交量：只要比 5 日平均多 1.1 倍即可 (輕微放量)
-    df['Vol_MA'] = df['Volume'].rolling(5).mean()
-    
-    # 【整合買入條件】：斜率向上 + 站上線 + 位階合理 + 微量增
-    df['Buy'] = np.where(
-        (df['Slope'] > 0) & (df['Close'] > df['Trend_Line']) & 
-        (df['Score'] < 75) & (df['Volume'] > df['Vol_MA'] * 1.1),
-        df['Low'] * 0.96, np.nan
-    )
-    
-    # 【整合賣出條件】：斜率轉負 (彎頭向下)
-    df['Sell'] = np.where(
-        (df['Slope'] < 0) & (df['Slope'].shift(1) >= 0),
-        df['High'] * 1.04, np.nan
-    )
-    return df
+# 3. 掃描清單 (已剔除景氣循環與國防)
+# 聚焦：半導體、AI伺服器、IC設計、優質金融
+SCAN_LIST = [
+    "2330", "2317", "2454", "2308", "2382", "3231", "6669", "2357", "2412", # 電子/權值
+    "2881", "2882", "2886", "2891", "2884", "5880", "2892", # 金融
+    "3034", "3035", "3661", "3443", "6415", # 高價/IC設計
+    "2379", "3008", "2377", "2353", "2324"  # 電子週邊
+]
 
-# --- UI 介面 ---
-st.title("🎯 大波段量化選股 V8.5 (整合優化版)")
-stock_input = st.sidebar.text_input("輸入台股代號", value="2330")
-
-if st.sidebar.button("啟動整合分析"):
-    raw, info = fetch_data(stock_input)
-    if raw is not None:
-        df = calculate_ultimate_system(raw).tail(300)
-        st.success(f"✅ 已成功優化 {info.get('longName')} 的波段訊號")
+if st.button("開始篩選起漲波段股"):
+    results = []
+    st.write("🔍 正在分析優質成長標的...")
+    progress = st.progress(0)
+    
+    for i, code in enumerate(SCAN_LIST):
+        try:
+            df = yf.Ticker(f"{code}.TW").history(period="1y")
+            hit, score, price = analyze_wave(df)
+            if hit:
+                results.append({"代號": code, "目前股價": price, "位階分數": round(score, 1), "建議": "🔥 剛起漲 (30%+ 潛力)"})
+            time.sleep(0.3) # 避免 Rate Limit
+            progress.progress((i + 1) / len(SCAN_LIST))
+        except: continue
         
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
-        
-        # 主圖 (K線 + 趨勢線)
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Trend_Line'], name="波段趨勢線", line=dict(color='#00e5ff', width=3)), row=1, col=1)
-        
-        # 買賣點 (加大顯示)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Buy'], name="波段起點 ▲", mode='markers', marker=dict(symbol='triangle-up', size=20, color='#00ff00', line=dict(width=2, color='white'))), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Sell'], name="趨勢轉弱 ▼", mode='markers', marker=dict(symbol='triangle-down', size=20, color='#ff4444', line=dict(width=2, color='white'))), row=1, col=1)
+    if results:
+        st.success(f"找到 {len(results)} 檔符合條件標的")
+        st.table(pd.DataFrame(results))
+    else:
+        st.warning("目前市場位階較高，暫無符合『底部剛放量起漲』的標的。請耐心等待回檔訊號。")
 
-        # 底部斜率圖 (讓你一眼看出趨勢有沒有變色)
-        colors = ['#00FFCC' if s > 0 else '#FF4444' for s in df['Slope']]
-        fig.add_trace(go.Bar(x=df.index, y=df['Slope'], name="趨勢斜率", marker_color=colors), row=2, col=1)
-
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], type='date')
-        fig.update_layout(height=800, template="plotly_dark", hovermode="x unified", margin=dict(t=30, b=10))
-        fig.update_xaxes(range=[df.index[-45], df.index[-1]]) # 預設顯示最近一個半月
-        
-        st.plotly_chart(fig, use_container_width=True)
+st.info("💡 為什麼不選景氣循環股？\n因為航運、鋼鐵容易因為報價見頂就暴跌。我們選的標的有產業護城河，波段一旦發動，漲勢較能持續。")
