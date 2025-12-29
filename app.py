@@ -4,118 +4,91 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import time
-import random
 
-# 1. 頁面風格
-st.set_page_config(page_title="量化選股 V6.2 - 靈敏波段版", layout="wide")
-st.markdown("""
-    <style>
-    .main { background-color: #000000; }
-    h1, h2, h3 { color: #00FFCC !important; font-weight: 800; }
-    .stInfo { background-color: #0E1117; border: 1px solid #00FFCC; color: white; }
-    </style>
-    """, unsafe_allow_html=True)
+# 1. 頁面基礎設定
+st.set_page_config(page_title="量化選股 V7.0 - 艾達趨勢版", layout="wide")
 
-# 2. 數據抓取 (加強穩定性)
+# 2. 抗封鎖抓取數據
 @st.cache_data(ttl=3600)
-def fetch_data_robust(code):
+def fetch_stock_data(code):
     for suffix in [".TW", ".TWO"]:
-        full_code = f"{code}{suffix}"
-        try:
-            ticker = yf.Ticker(full_code)
-            hist = ticker.history(period="3y", interval="1d")
-            if not hist.empty:
-                return hist, ticker.info
-        except Exception:
-            continue
+        ticker = yf.Ticker(f"{code}{suffix}")
+        hist = ticker.history(period="3y")
+        if not hist.empty: return hist, ticker.info
     return None, None
 
-# 3. 超級趨勢 SuperTrend
-def calculate_supertrend(df, period=10, multiplier=3.5): # 稍微調低乘數增加靈敏度
-    df = df.copy()
-    hl2 = (df['High'] + df['Low']) / 2
-    df['TR'] = np.maximum(df['High'] - df['Low'], 
-               np.maximum(abs(df['High'] - df['Close'].shift(1)), 
-               abs(df['Low'] - df['Close'].shift(1))))
-    df['ATR'] = df['TR'].rolling(period).mean()
-    df['upperband'] = hl2 + (multiplier * df['ATR'])
-    df['lowerband'] = hl2 - (multiplier * df['ATR'])
-    df['in_trend'] = True
-
-    for i in range(1, len(df.index)):
-        if df['Close'].iloc[i] > df['upperband'].iloc[i-1]:
-            df.iat[i, df.columns.get_loc('in_trend')] = True
-        elif df['Close'].iloc[i] < df['lowerband'].iloc[i-1]:
-            df.iat[i, df.columns.get_loc('in_trend')] = False
-        else:
-            df.iat[i, df.columns.get_loc('in_trend')] = df['in_trend'].iloc[i-1]
-            if df['in_trend'].iloc[i] and df['lowerband'].iloc[i] < df['lowerband'].iloc[i-1]:
-                df.iat[i, df.columns.get_loc('lowerband')] = df['lowerband'].iloc[i-1]
-            if not df['in_trend'].iloc[i] and df['upperband'].iloc[i] > df['upperband'].iloc[i-1]:
-                df.iat[i, df.columns.get_loc('upperband')] = df['upperband'].iloc[i-1]
-    df['Trend_Line'] = np.where(df['in_trend'], df['lowerband'], df['upperband'])
-    return df
-
-# 4. 指標整合與買賣邏輯
-def process_wave_logic(hist):
-    df = hist.copy()
+# 3. 艾達趨勢指標計算
+def calculate_elder_keltner(df):
+    # EMA 20 (波段核心線)
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    # ATR (計算通道寬度)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(20).mean()
+    
+    # 肯特納通道
+    df['KC_Upper'] = df['EMA20'] + (2 * df['ATR'])
+    df['KC_Lower'] = df['EMA20'] - (2 * df['ATR'])
+    
+    # 艾達透視指標 (Bull/Bear Power)
+    df['Bull_Power'] = df['High'] - df['EMA20']
+    df['Bear_Power'] = df['Low'] - df['EMA20']
+    
     # 技術檔位百分位 (Score)
     def p(s): return s.rolling(252, min_periods=10).apply(lambda x: (x < x[-1]).mean() * 100)
-    df['Score'] = (p(df['Close']) * 0.5) + (p(df['Close'].diff().rolling(14).mean()) * 0.5)
+    df['Score'] = (p(df['Close']) * 0.6) + (p(df['Bull_Power']) * 0.4)
     
-    df = calculate_supertrend(df)
-    
-    # 成交量過濾：只要比過去 5 日平均量高 1.1 倍 (門檻降低)
-    df['Vol_MA5'] = df['Volume'].rolling(5).mean()
-    
-    # 【靈敏大波段買點】：趨勢轉多 + 檔位中低位(<80) + 成交量微增(1.1x)
+    # 【艾達波段買賣邏輯】
+    # 買入：股價站上 EMA20 且 Bear_Power 轉正 (代表空頭力道衰竭) 且 位階中低
     df['Buy'] = np.where(
-        (df['in_trend']==True) & (df['in_trend'].shift(1)==False) & 
-        (df['Score'] < 80) & 
-        (df['Volume'] > (df['Vol_MA5'] * 1.1)), 
-        df['Low']*0.95, np.nan
+        (df['Close'] > df['EMA20']) & (df['Bear_Power'] > 0) & 
+        (df['Bear_Power'].shift(1) < 0) & (df['Score'] < 75),
+        df['Low'] * 0.96, np.nan
     )
-    # 【大波段賣點】：趨勢轉空
-    df['Sell'] = np.where((df['in_trend']==False) & (df['in_trend'].shift(1)==True), df['High']*1.05, np.nan)
+    
+    # 賣出：股價跌破 EMA20 或 Bull_Power 轉負
+    df['Sell'] = np.where(
+        (df['Close'] < df['EMA20']) & (df['Close'].shift(1) > df['EMA20']),
+        df['High'] * 1.04, np.nan
+    )
     return df
 
 # --- UI 介面 ---
-st.title("🎯 大波段量化分析 V6.2 (靈敏升級版)")
+st.title("🎯 大波段量化選股 V7.0 (艾達趨勢系統)")
 
 with st.sidebar:
     stock_input = st.text_input("輸入台股代號", value="2330")
-    run_btn = st.button("執行波段掃描")
+    if st.button("執行艾達波段掃描"):
+        st.session_state.run = True
 
-if run_btn:
-    hist_raw, info = fetch_data_robust(stock_input)
+if "run" in st.session_state:
+    hist_raw, info = fetch_stock_data(stock_input)
     if hist_raw is None:
-        st.error("暫時無法獲取數據，請稍後重試。")
+        st.error("數據抓取失敗，請檢查代號")
     else:
-        df = process_wave_logic(hist_raw).tail(350)
-        st.info(f"📊 **{info.get('longName', stock_input)}**：買賣條件已放寬，更能捕捉起漲轉折。")
+        df = calculate_elder_keltner(hist_raw).tail(300)
+        st.info(f"📊 **{info.get('longName', stock_input)}** 波段診斷：\n"
+                "🔹 **藍色背景區**：肯特納通道，股價在通道上半部代表強勢波段。\n"
+                "🔹 **核心邏輯**：當空頭力道(Bear Power)消失且站上均線時，即為穩健起漲點。")
 
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                           vertical_spacing=0.03, specs=[[{"secondary_y": True}], [{}]],
-                           row_heights=[0.75, 0.25])
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
 
-        # 主圖與趨勢線
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Trend_Line'], name="趨勢防護線", line=dict(color='#00e5ff', width=3)), row=1, col=1, secondary_y=False)
+        # 主圖
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Upper'], name="通道上軌", line=dict(color='rgba(0, 255, 204, 0.2)')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], name="波段核心線", line=dict(color='cyan', width=2)), row=1, col=1)
         
-        # 買賣點標記
-        fig.add_trace(go.Scatter(x=df.index, y=df['Buy'], name="大波段買點 ▲", mode='markers', marker=dict(symbol='triangle-up', size=20, color='#00ff00', line=dict(width=2, color='white'))), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Sell'], name="趨勢轉弱 ▼", mode='markers', marker=dict(symbol='triangle-down', size=20, color='#ff4444', line=dict(width=2, color='white'))), row=1, col=1, secondary_y=False)
+        # 買賣點
+        fig.add_trace(go.Scatter(x=df.index, y=df['Buy'], name="波段起點 ▲", mode='markers', marker=dict(symbol='triangle-up', size=18, color='#00FF00')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Sell'], name="趨勢結束 ▼", mode='markers', marker=dict(symbol='triangle-down', size=18, color='#FF4444')), row=1, col=1)
 
-        # 檔位分數
-        fig.add_trace(go.Scatter(x=df.index, y=df['Score'], name="檔位分數", line=dict(color='rgba(0, 255, 204, 0.4)', width=1.5), fill='tozeroy', fillcolor='rgba(0, 255, 204, 0.05)'), row=1, col=1, secondary_y=True)
+        # 艾達力道圖 (下方子圖)
+        fig.add_trace(go.Bar(x=df.index, y=df['Bull_Power'], name="牛力(多頭)", marker_color='#00ff88'), row=2, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['Bear_Power'], name="熊力(空頭)", marker_color='#ff4444'), row=2, col=1)
 
-        # 成交量
-        colors = ['#00ff88' if r['Close'] >= r['Open'] else '#ff4444' for i, r in df.iterrows()]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color=colors), row=2, col=1)
-
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], rangeslider_visible=False)
-        fig.update_layout(height=800, template="plotly_dark", hovermode="x unified", margin=dict(t=30, b=10))
-        fig.update_xaxes(range=[df.index[-40], df.index[-1]])
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], type='date')
+        fig.update_layout(height=850, template="plotly_dark", hovermode="x unified")
+        fig.update_xaxes(range=[df.index[-50], df.index[-1]])
         
         st.plotly_chart(fig, use_container_width=True)
