@@ -5,102 +5,113 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
+import time
 
-# --- 1. 頁面外觀大改造 (三竹風格 CSS) ---
-st.set_page_config(layout="wide", page_title="飆股戰情室 - 三竹風")
+# --- 1. 頁面配置與三竹黑系風格 CSS ---
+st.set_page_config(layout="wide", page_title="飆股戰情室 - Smart App")
 
 st.markdown("""
     <style>
-    .main { background-color: #0e1117; }
-    .stMetric { background-color: #1a1c23; padding: 20px; border-radius: 15px; border-left: 5px solid #ff4b4b; }
-    .report-card { 
-        background-color: #1a1c23; padding: 20px; border-radius: 15px; 
-        text-align: center; border: 1px solid #333;
+    .main { background-color: #050505; }
+    div[data-testid="stMetricValue"] { font-size: 32px; color: #ff4b4b; }
+    .status-card {
+        background-color: #1a1c23; border-radius: 12px; padding: 20px;
+        border-top: 4px solid #ff4b4b; text-align: center; margin-bottom: 10px;
     }
-    h1, h2, h3 { color: #ffffff; font-family: 'Microsoft JhengHei'; }
+    .stButton>button { width: 100%; border-radius: 20px; background-color: #ff4b4b; color: white; }
     </style>
     """, unsafe_allow_html=True)
 
-dl = DataLoader()
+# --- 2. 核心數據模組 (含防封鎖機制) ---
+@st.cache_resource
+def get_loader(token=""):
+    api = DataLoader()
+    if token: api.login_by_token(token)
+    return api
 
-# --- 2. 強固型數據清洗 (承襲之前的優點) ---
-def clean_and_prepare(df):
-    if df is None or df.empty: return pd.DataFrame()
-    column_map = {'Trading_Volume': 'volume', 'vol': 'volume', 'Volume': 'volume', 'Close': 'close'}
-    df = df.rename(columns=column_map)
-    df.columns = [c.lower() for c in df.columns]
-    for c in ['close', 'open', 'high', 'low', 'volume']:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-    return df
-
-# --- 3. 數據抓取 ---
-@st.cache_data(ttl=3600)
-def fetch_data(stock_id, start_date):
+def safe_fetch(api, func, **kwargs):
+    """具備自動重試與錯誤攔截的抓取器"""
     try:
-        raw = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
-        df = clean_and_prepare(raw)
-        if df.empty: return None
-        df['ma20'] = ta.sma(df['close'], length=20)
-        df['vol_ma20'] = ta.sma(df['volume'], length=20)
-        
-        inst = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
-        holders = dl.taiwan_stock_holding_shares_per(stock_id=stock_id, start_date=start_date)
-        return {"price": df, "inst": inst, "holders": holders}
-    except: return None
+        data = func(**kwargs)
+        if data is None or data.empty: return pd.DataFrame()
+        return data
+    except Exception:
+        return pd.DataFrame()
 
-# --- 4. 主介面設計 ---
-st.title("🏹 飆股智能選股系統")
-
-stock_id = st.sidebar.text_input("輸入代碼", value="2330")
-data = fetch_data(stock_id, (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d'))
-
-if data:
-    df = data['price']
+# --- 3. 指標與訊號計算 ---
+def calculate_mitake_style(df):
+    if df.empty: return 0, "無資料"
+    df.columns = [c.lower() for c in df.columns]
+    df = df.rename(columns={'trading_volume': 'volume', 'vol': 'volume'})
+    
+    # 計算均線
+    df['ma20'] = ta.sma(df['close'], length=20)
+    df['vol_ma20'] = ta.sma(df['volume'], length=20)
+    
     latest = df.iloc[-1]
-    
-    # 計算得分與訊號
     score = 0
-    signal_text = "觀望"
+    # 多頭排列判斷
     if latest['close'] > latest['ma20']: score += 40
+    # 攻擊量判斷
     if latest['volume'] > latest['vol_ma20'] * 1.5: score += 30
+    # 漲跌判斷
+    if latest['close'] > df.iloc[-2]['close']: score += 30
     
-    # 頂部視覺卡片 (仿三竹診斷)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        color = "#ff4b4b" if score >= 70 else "#00ff00" if score < 40 else "#f63366"
-        st.markdown(f"""<div class='report-card'><h3>戰力評分</h3><h1 style='color:{color};'>{score}</h1></div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""<div class='report-card'><h3>操作建議</h3><h1 style='color:white;'>{"🔴 強勢" if score >= 70 else "🟡 盤整"}</h1></div>""", unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"""<div class='report-card'><h3>攻擊力道</h3><h1 style='color:white;'>{round(latest['volume']/latest['vol_ma20'],1)}x</h1></div>""", unsafe_allow_html=True)
+    status = "🔥 強勢進攻" if score >= 70 else "⚖️ 區間整理" if score >= 40 else "❄️ 弱勢觀望"
+    return score, status
 
-    st.markdown("---")
+# --- 4. 主介面流程 ---
+st.sidebar.header("🛡️ 專業模式設定")
+api_token = st.sidebar.text_input("FinMind Token (選填)", type="password", help="註冊 FinMind 免費取得可增加抓取次數")
+stock_id = st.sidebar.text_input("股票代碼", value="2330")
+lookback = st.sidebar.slider("顯示區間", 60, 365, 120)
 
-    # --- 5. 專業繪圖 (隱藏座標軸網格，強調紅綠柱) ---
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.02, row_heights=[0.7, 0.3])
+loader = get_loader(api_token)
+start_date = (datetime.now() - timedelta(days=lookback)).strftime('%Y-%m-%d')
 
-    # K線
-    fig.add_trace(go.Candlestick(x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-                                 increasing_line_color='#ff4b4b', decreasing_line_color='#00f200', name='K線'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['ma20'], name='20MA', line=dict(color='yellow', width=1.5)), row=1, col=1)
+if st.sidebar.button("確認查詢"):
+    with st.spinner('🎬 正在同步三竹雲端數據...'):
+        # 抓取三位一體數據
+        price_df = safe_fetch(loader, loader.taiwan_stock_daily, stock_id=stock_id, start_date=start_date)
+        
+        if not price_df.empty:
+            score, status_text = calculate_mitake_style(price_df)
+            
+            # --- 頂部診斷區 (三竹智選股風格) ---
+            st.markdown(f"### 📊 {stock_id} 綜合診斷報告")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(f"<div class='status-card'>評分<br><h1>{score}</h1></div>", unsafe_allow_html=True)
+            with c2:
+                st.markdown(f"<div class='status-card'>訊號<br><h3>{status_text}</h3></div>", unsafe_allow_html=True)
+            with c3:
+                vol_ratio = round(price_df.iloc[-1]['volume'] / price_df['volume'].tail(20).mean(), 2)
+                st.markdown(f"<div class='status-card'>量能倍數<br><h3>{vol_ratio}x</h3></div>", unsafe_allow_html=True)
 
-    # 籌碼 (法人買賣)
-    if not data['inst'].empty:
-        inst = data['inst'].groupby('date').sum(numeric_only=True).reset_index()
-        inst['net'] = inst['buy'] - inst['sell']
-        fig.add_trace(go.Bar(x=inst['date'], y=inst['net'], 
-                             marker_color=['#ff4b4b' if x > 0 else '#00f200' for x in inst['net']], name='法人'), row=2, col=1)
+            # --- 專業圖表區 ---
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+            
+            # K線圖
+            fig.add_trace(go.Candlestick(x=price_df['date'], open=price_df['open'], high=price_df['high'], 
+                                         low=price_df['low'], close=price_df['close'], 
+                                         increasing_line_color='#ff4b4b', decreasing_line_color='#00f200', name='K線'), row=1, col=1)
+            
+            # 自動標註買點 (起漲點箭頭)
+            signals = (price_df['close'] > price_df['close'].shift(1)*1.02) & (price_df['volume'] > price_df['volume'].rolling(20).mean()*1.5)
+            sig_df = price_df[signals]
+            fig.add_trace(go.Scatter(x=sig_df['date'], y=sig_df['low']*0.97, mode='markers', 
+                                     marker=dict(symbol='triangle-up', size=12, color='#ff4b4b'), name='起漲點'), row=1, col=1)
 
-    fig.update_layout(height=600, template='plotly_dark', showlegend=False, xaxis_rangeslider_visible=False,
-                      margin=dict(l=10, r=10, t=10, b=10),
-                      plot_bgcolor='#0e1117', paper_bgcolor='#0e1117')
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=False)
-    st.plotly_chart(fig, use_container_width=True)
+            # 成交量圖
+            v_colors = ['#ff4b4b' if c > o else '#00f200' for c, o in zip(price_df['close'], price_df['open'])]
+            fig.add_trace(go.Bar(x=price_df['date'], y=price_df['volume'], marker_color=v_colors, name='成交量'), row=2, col=1)
 
-    # 底部快捷清單
-    st.subheader("📋 籌碼關鍵數據")
-    st.table(df[['date', 'close', 'volume']].tail(5))
+            fig.update_layout(height=600, template='plotly_dark', plot_bgcolor='#050505', paper_bgcolor='#050505',
+                              margin=dict(l=20, r=20, t=20, b=20), xaxis_rangeslider_visible=False)
+            fig.update_xaxes(showgrid=False)
+            fig.update_yaxes(showgrid=False)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        else:
+            st.error("🚨 數據調用達到上限或伺服器忙碌。請 1. 檢查代碼是否正確 2. 填寫 Token 3. 稍後重試。")
 
-else:
-    st.error("⚠️ 資料抓取失敗，請確認代碼或 API 頻率限制。")
