@@ -2,96 +2,73 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import time
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from scipy.signal import argrelextrema
 
-# 1. 頁面配置
-st.set_page_config(page_title="台股波段全能導航 V13.0", layout="wide")
-st.title("🛡️ 台股優質成長股 - 波段導航系統")
+def get_vcp_plot(df, code):
+    df = df.tail(120).copy() # 取最近半年
+    
+    # 1. 尋找局部高點 (用來畫收縮趨勢線)
+    # order=5 代表左右各 5 天內最高
+    n = 5 
+    df['Max'] = df['High'].iloc[argrelextrema(df['High'].values, np.greater_equal, order=n)[0]]
+    df['Min'] = df['Low'].iloc[argrelextrema(df['Low'].values, np.less_equal, order=n)[0]]
+    
+    peaks = df.dropna(subset=['Max'])
+    troughs = df.dropna(subset=['Min'])
 
-# 2. 定義優質清單 (已排除循環股與國防股)
-MASTER_LIST = {
-    "核心半導體/IC設計": ["2330", "2454", "3034", "3035", "3661", "3443", "6415", "2379", "3374", "6147"],
-    "AI伺服器與組裝": ["2317", "2308", "2382", "3231", "6669", "2357", "2377", "2353", "2324"],
-    "中小型設備/材料": ["3131", "3583", "6187", "6640", "1560", "3680", "1773", "4768"],
-    "AI散熱/零組件": ["3017", "3324", "3653", "2313", "2368", "3044", "8210", "3013"],
-    "優質金融/穩定內需": ["2881", "2882", "2886", "2891", "2884", "5880", "2912", "5904", "9941"]
-}
+    # 2. 建立繪圖
+    fig = go.Figure()
+    
+    # K線圖
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"))
+    
+    # 均線 (VCP 必須是多頭排列)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'].rolling(50).mean(), name="50MA", line=dict(color='orange', width=1.5)))
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'].rolling(200).mean(), name="200MA", line=dict(color='red', width=1.5)))
 
-# 3. 核心運算函數
-def calculate_indicators(df, mult=4.0):
-    df = df.copy()
-    # SuperTrend
-    hl2 = (df['High'] + df['Low']) / 2
-    tr = np.maximum(df['High'] - df['Low'], np.maximum(abs(df['High'] - df['Close'].shift(1)), abs(df['Low'] - df['Close'].shift(1))))
-    atr = tr.rolling(12).mean()
-    df['UpBand'] = hl2 + (mult * atr)
-    df['DnBand'] = hl2 - (mult * atr)
-    df['Trend'] = True
-    for i in range(1, len(df)):
-        if df['Close'].iloc[i] > df['UpBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('Trend')] = True
-        elif df['Close'].iloc[i] < df['DnBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('Trend')] = False
+    # 3. 自動畫出收縮邊界 (VCP 趨勢線)
+    if len(peaks) >= 2:
+        # 連接最近兩個高點
+        fig.add_trace(go.Scatter(x=peaks.index[-3:], y=peaks['Max'].iloc[-3:], 
+                                 mode='lines+markers', name="收縮邊界", 
+                                 line=dict(color='yellow', dash='dash')))
+        
+        # 4. 自動畫出 Pivot 突破線 (最近一個高點的水平線)
+        pivot_price = peaks['Max'].iloc[-1]
+        fig.add_hline(y=pivot_price, line_dash="dot", line_color="lime", line_width=2,
+                      annotation_text=f"Pivot: {pivot_price:.1f}", annotation_position="top right")
+
+    # 5. 成交量 (VCP 重視成交量縮小)
+    vol_colors = ['green' if df['Close'].iloc[i] > df['Open'].iloc[i] else 'red' for i in range(len(df))]
+    
+    fig.update_layout(
+        title=f"📊 {code} VCP 型態自動分析 (自動識別收縮區與突破點)",
+        template="plotly_dark",
+        height=700,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified"
+    )
+    
+    return fig
+
+# --- Streamlit UI ---
+st.set_page_config(page_title="VCP 自動繪圖系統", layout="wide")
+st.sidebar.title("🦅 VCP 形態導航")
+code = st.sidebar.text_input("輸入台股代號", "2330")
+
+if st.sidebar.button("分析並繪製 VCP"):
+    hist = yf.Ticker(f"{code}.TW").history(period="1y")
+    if not hist.empty:
+        fig = get_vcp_plot(hist, code)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 顯示收縮資訊
+        highs = hist['High'].tail(60)
+        lows = hist['Low'].tail(60)
+        total_range = (highs.max() - lows.min()) / lows.min()
+        st.write(f"📈 **當前 60 日最大震幅**：{total_range:.2%}")
+        if total_range < 0.15:
+            st.success("✅ 波動已極度收縮，隨時準備迎接 30%+ 暴力突破！")
         else:
-            df.iat[i, df.columns.get_loc('Trend')] = df['Trend'].iloc[i-1]
-            if df['Trend'].iloc[i] and df['DnBand'].iloc[i] < df['DnBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('DnBand')] = df['DnBand'].iloc[i-1]
-            if not df['Trend'].iloc[i] and df['UpBand'].iloc[i] > df['UpBand'].iloc[i-1]: df.iat[i, df.columns.get_loc('UpBand')] = df['UpBand'].iloc[i-1]
-    df['ST_Line'] = np.where(df['Trend'], df['DnBand'], df['UpBand'])
-    # Score
-    df['Score'] = (df['Close'].rolling(252).apply(lambda x: (x < x[-1]).mean() * 100))
-    return df
-
-# --- 側邊欄：功能切換 ---
-mode = st.sidebar.radio("選擇功能", ["📊 全市場掃描", "🔍 個股深度診斷"])
-
-if mode == "📊 全市場掃描":
-    if st.button("啟動全方位掃描"):
-        all_hits = []
-        st.write("🔍 正在分析優質標的...")
-        progress = st.progress(0)
-        total = sum(len(v) for v in MASTER_LIST.values())
-        curr = 0
-        for group, codes in MASTER_LIST.items():
-            for code in codes:
-                try:
-                    df = yf.Ticker(f"{code}.TW").history(period="1y")
-                    df = calculate_indicators(df)
-                    # 買入訊號條件
-                    hit = (df['Trend'].iloc[-1] and not df['Trend'].iloc[-2] and df['Score'].iloc[-1] < 75)
-                    if hit:
-                        all_hits.append({"族群": group, "代號": code, "股價": round(df['Close'].iloc[-1], 1), "位階": round(df['Score'].iloc[-1], 1)})
-                except: pass
-                curr += 1
-                progress.progress(curr/total)
-        if all_hits:
-            st.success(f"發現 {len(all_hits)} 檔種子標的")
-            st.table(pd.DataFrame(all_hits))
-        else:
-            st.info("目前尚無符合起漲條件標的。")
-
-else:
-    stock_code = st.sidebar.text_input("輸入台股代號 (如: 2330)", value="2330")
-    if st.sidebar.button("開始診斷"):
-        data = yf.Ticker(f"{stock_code}.TW").history(period="2y")
-        if not data.empty:
-            df = calculate_indicators(data).tail(250)
-            
-            # 建立圖表
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
-            # K線
-            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
-            # SuperTrend 線 (變色處理)
-            line_color = ['#00FFCC' if t else '#FF4444' for t in df['Trend']]
-            fig.add_trace(go.Scatter(x=df.index, y=df['ST_Line'], name="波段防禦線", line=dict(color='cyan', width=2, dash='dot')), row=1, col=1)
-            
-            # 成交量
-            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="成交量", marker_color='rgba(100,100,100,0.5)'), row=2, col=1)
-            
-            fig.update_layout(height=800, template="plotly_dark", hovermode="x unified")
-            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # 診斷文字
-            status = "🚀 多頭波段中" if df['Trend'].iloc[-1] else "🛑 空頭整理中"
-            st.metric("趨勢狀態", status)
-            st.write(f"💡 **操作建議**：只要收盤沒跌破 **{df['ST_Line'].iloc[-1]:.1f}**，30% 的波段目標就繼續持有。")
+            st.info("⌛ 波動仍大，持續等待波段收縮...")
