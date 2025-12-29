@@ -5,19 +5,19 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# 1. 頁面基礎設定
-st.set_page_config(page_title="量化選股 V3.0 Pro", layout="wide")
+# 1. 頁面風格
+st.set_page_config(page_title="量化選股 V4.0 - 低買高賣邏輯版", layout="wide")
 st.markdown("""
     <style>
     .main { background-color: #000000; }
     h1, h2, h3 { color: #00FFCC !important; font-weight: 800; }
-    .stAlert { border-radius: 10px; border: none; }
+    .stInfo { background-color: #112233; border: 1px solid #00FFCC; color: white; }
     </style>
     """, unsafe_allow_html=True)
 
-# 2. 數據抓取 (加上 Cache 避免 Rate Limit)
-@st.cache_data(ttl=3600) # 快取 1 小時
-def fetch_stock_data(code):
+# 2. 數據抓取與緩存
+@st.cache_data(ttl=3600)
+def fetch_data(code):
     for suffix in [".TW", ".TWO"]:
         ticker = yf.Ticker(f"{code}{suffix}")
         hist = ticker.history(period="3y")
@@ -25,92 +25,95 @@ def fetch_stock_data(code):
             return hist, ticker.info
     return None, None
 
-# 3. 指標計算邏輯
-def calculate_metrics(hist):
+# 3. 核心指標計算 (改用布林通道與位階過濾)
+def calculate_advanced_metrics(hist):
     df = hist.copy()
-    # RSI
+    
+    # 技術指標基礎
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['RSI'] = 100 - (100 / (1 + gain/loss))
     
-    # MA & BIAS
+    # 布林通道 (20, 2)
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA60'] = df['Close'].rolling(window=60).mean()
-    df['BIAS'] = (df['Close'] - df['MA20']) / df['MA20'] * 100
+    df['STD'] = df['Close'].rolling(window=20).std()
+    df['Upper'] = df['MA20'] + (2 * df['STD'])
+    df['Lower'] = df['MA20'] - (2 * df['STD'])
     
-    # 技術檔位百分位 (0-100)
+    # 歷史百分位檔位計算 (0-100)
     def p(s): return s.rolling(252, min_periods=10).apply(lambda x: (x < x[-1]).mean() * 100)
-    df['Score'] = (p(df['RSI']) * 0.5) + (p(df['BIAS']) * 0.5)
+    df['Score'] = (p(df['RSI']) * 0.5) + (p(df['Close'].rolling(20).apply(lambda x: (x[-1]-x.mean())/x.std() if x.std() != 0 else 0)) * 0.5)
     
-    # 訊號
-    df['Buy'] = np.where((df['MA20'].shift(1) <= df['MA60'].shift(1)) & (df['MA20'] > df['MA60']), df['Low']*0.98, np.nan)
-    df['Sell'] = np.where((df['MA20'].shift(1) >= df['MA60'].shift(1)) & (df['MA20'] < df['MA60']), df['High']*1.02, np.nan)
+    # --- [核心修改] 買賣決策邏輯 ---
+    # 買入：分數低於 40(便宜) 且 股價站上中軌(轉強)
+    df['Buy'] = np.where(
+        (df['Score'] < 40) & (df['Close'] > df['MA20']) & (df['Close'].shift(1) <= df['MA20'].shift(1)),
+        df['Low'] * 0.97, np.nan
+    )
+    
+    # 賣出：分數高於 70(過熱) 且 股價跌破布林上軌(轉弱)
+    df['Sell'] = np.where(
+        (df['Score'] > 70) & (df['Close'] < df['Upper']) & (df['Close'].shift(1) >= df['Upper'].shift(1)),
+        df['High'] * 1.03, np.nan
+    )
+    
     return df
 
 # --- UI 介面 ---
-st.title("🎯 四維度量化選股 V3.0 (流暢優化版)")
+st.title("🎯 量化選股 V4.0 (位階轉折版)")
 
 with st.sidebar:
     stock_code = st.text_input("輸入台股代號", value="2330")
-    if st.button("啟動分析"):
-        st.session_state.run = True
+    start_btn = st.button("啟動高低位分析")
 
-if "run" in st.session_state:
-    hist_raw, info = fetch_stock_data(stock_code)
+if start_btn:
+    hist_raw, info = fetch_data(stock_code)
     
     if hist_raw is None:
-        st.error("❌ 抓取失敗：請檢查代號或稍後再試。")
+        st.error("數據抓取失敗，請檢查代號。")
     else:
-        df = calculate_metrics(hist_raw).tail(400)
+        df = calculate_advanced_metrics(hist_raw).tail(300)
         
-        # [優化] 解釋文字放在最上方
-        st.info(f"📊 **{info.get('longName', stock_code)}** 分析報告：\n"
-                "🔹 **綠色▲**：黃金交叉買點 | **紅色▼**：死亡交叉賣點\n"
-                "🔹 **底層綠色區塊**：技術檔位分數 (越高代表越過熱，越低代表越便宜)")
+        # 解釋文字移至上方
+        st.info(f"📊 **{info.get('longName', stock_code)}** 決策指南：\n"
+                "🔹 **綠色▲ 買入**：技術檔位在**低位(便宜區)**且股價站上月線，代表起漲點。\n"
+                "🔹 **紅色▼ 賣出**：技術檔位在**高位(過熱區)**且股價脫離強勢區，代表獲利點。\n"
+                "🔹 **中間青色線**：布林中軌(月線)，股價之上看多，之下看空。")
 
-        # 建立雙軸圖表
+        # 繪製圖表
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        # 主 Y 軸：K 線與均線
+        # 1. K 線圖
         fig.add_trace(go.Candlestick(
             x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
             name="K線", increasing_line_color='#00ff88', decreasing_line_color='#ff4444'
         ), secondary_y=False)
-        
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name="MA20", line=dict(color='#00e5ff', width=1.2)), secondary_y=False)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name="MA60", line=dict(color='#cc00ff', width=1.2)), secondary_y=False)
 
-        # 訊號圖標
-        fig.add_trace(go.Scatter(x=df.index, y=df['Buy'], name="買入", mode='markers', marker=dict(symbol='triangle-up', size=14, color='#00ff00')), secondary_y=False)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Sell'], name="賣出", mode='markers', marker=dict(symbol='triangle-down', size=14, color='#ff0000')), secondary_y=False)
+        # 2. 布林通道 (輔助視覺)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Upper'], name="布林上軌", line=dict(color='rgba(255,255,255,0.2)', dash='dot')), secondary_y=False)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name="布林中軌(月線)", line=dict(color='cyan', width=1.5)), secondary_y=False)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Lower'], name="布林下軌", line=dict(color='rgba(255,255,255,0.2)', dash='dot')), secondary_y=False)
 
-        # 副 Y 軸：檔位分數 (固定範圍 0-100)
+        # 3. 修正後的買賣訊號
+        fig.add_trace(go.Scatter(x=df.index, y=df['Buy'], name="低位買入 ▲", mode='markers', marker=dict(symbol='triangle-up', size=15, color='#00ff00', line=dict(width=1, color='white'))), secondary_y=False)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Sell'], name="高位賣出 ▼", mode='markers', marker=dict(symbol='triangle-down', size=15, color='#ff0000', line=dict(width=1, color='white'))), secondary_y=False)
+
+        # 4. 技術檔位分數 (副軸)
         fig.add_trace(go.Scatter(
             x=df.index, y=df['Score'], name="技術檔位分數",
-            line=dict(color='rgba(0, 255, 204, 0.5)', width=2),
+            line=dict(color='rgba(0, 255, 204, 0.6)', width=2),
             fill='tozeroy', fillcolor='rgba(0, 255, 204, 0.1)'
         ), secondary_y=True)
 
-        # [優化] 滑動順暢度設定
-        fig.update_xaxes(
-            rangebreaks=[dict(bounds=["sat", "mon"])], # 跳過假日
-            rangeslider_visible=True,
-            rangeslider_thickness=0.1,
-            type='date'
-        )
-        
+        # 互動與縮放優化
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], rangeslider_visible=True, type='date')
         fig.update_layout(
-            height=700, # 固定高度
-            margin=dict(l=10, r=10, t=20, b=10),
-            template="plotly_dark",
-            hovermode="x unified",
-            yaxis_title="股價 (TWD)",
-            yaxis2=dict(title="檔位分數 (0-100)", range=[0, 105], side="right", showgrid=False),
-            legend=dict(orientation="h", y=1.1)
+            height=750, template="plotly_dark", hovermode="x unified",
+            yaxis_title="股價 (TWD)", yaxis2=dict(title="檔位分數 (0-100)", range=[0, 105], side="right", showgrid=False),
+            legend=dict(orientation="h", y=1.05)
         )
+        # 預設顯示最近一個月
+        fig.update_xaxes(range=[df.index[-30], df.index[-1]])
 
-        # 預設顯示最近 30 根 K 線
-        fig.update_xaxes(range=[df.index[-35], df.index[-1]])
-
-        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': False})
+        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
