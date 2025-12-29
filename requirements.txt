@@ -9,3 +9,4 @@ mplfinance
 matplotlib
 scipy
 streamlit
+FinMind
