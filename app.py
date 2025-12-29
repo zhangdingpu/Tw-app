@@ -5,113 +5,102 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
-import time
 
-# --- 1. 頁面配置與三竹黑系風格 CSS ---
-st.set_page_config(layout="wide", page_title="飆股戰情室 - Smart App")
+# --- 1. 頁面風格配置 ---
+st.set_page_config(layout="wide", page_title="飆股戰情室 Pro")
 
 st.markdown("""
     <style>
-    .main { background-color: #050505; }
-    div[data-testid="stMetricValue"] { font-size: 32px; color: #ff4b4b; }
-    .status-card {
-        background-color: #1a1c23; border-radius: 12px; padding: 20px;
-        border-top: 4px solid #ff4b4b; text-align: center; margin-bottom: 10px;
-    }
-    .stButton>button { width: 100%; border-radius: 20px; background-color: #ff4b4b; color: white; }
+    .stMetric { background-color: #1a1c23; padding: 15px; border-radius: 10px; border-top: 3px solid #ff4b4b; }
+    .status-box { background-color: #1a1c23; padding: 20px; border-radius: 15px; text-align: center; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. 核心數據模組 (含防封鎖機制) ---
-@st.cache_resource
-def get_loader(token=""):
-    api = DataLoader()
-    if token: api.login_by_token(token)
-    return api
-
-def safe_fetch(api, func, **kwargs):
-    """具備自動重試與錯誤攔截的抓取器"""
-    try:
-        data = func(**kwargs)
-        if data is None or data.empty: return pd.DataFrame()
-        return data
-    except Exception:
+# --- 2. 欄位標準化與清洗 (解決 KeyError 的核心) ---
+def standardize_columns(df):
+    if df is None or df.empty:
         return pd.DataFrame()
-
-# --- 3. 指標與訊號計算 ---
-def calculate_mitake_style(df):
-    if df.empty: return 0, "無資料"
-    df.columns = [c.lower() for c in df.columns]
-    df = df.rename(columns={'trading_volume': 'volume', 'vol': 'volume'})
     
-    # 計算均線
-    df['ma20'] = ta.sma(df['close'], length=20)
-    df['vol_ma20'] = ta.sma(df['volume'], length=20)
+    # 建立映射字典，解決 FinMind 欄位不統一問題
+    mapping = {
+        'Trading_Volume': 'volume', 'vol': 'volume', 'Volume': 'volume',
+        'Date': 'date', 'Close': 'close', 'Open': 'open', 'High': 'high', 'Low': 'low'
+    }
+    df = df.rename(columns=mapping)
+    df.columns = [c.lower() for c in df.columns] # 全部轉小寫
     
-    latest = df.iloc[-1]
-    score = 0
-    # 多頭排列判斷
-    if latest['close'] > latest['ma20']: score += 40
-    # 攻擊量判斷
-    if latest['volume'] > latest['vol_ma20'] * 1.5: score += 30
-    # 漲跌判斷
-    if latest['close'] > df.iloc[-2]['close']: score += 30
-    
-    status = "🔥 強勢進攻" if score >= 70 else "⚖️ 區間整理" if score >= 40 else "❄️ 弱勢觀望"
-    return score, status
+    # 確保數值欄位正確轉換
+    for col in ['close', 'open', 'high', 'low', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
 
-# --- 4. 主介面流程 ---
-st.sidebar.header("🛡️ 專業模式設定")
-api_token = st.sidebar.text_input("FinMind Token (選填)", type="password", help="註冊 FinMind 免費取得可增加抓取次數")
-stock_id = st.sidebar.text_input("股票代碼", value="2330")
-lookback = st.sidebar.slider("顯示區間", 60, 365, 120)
-
-loader = get_loader(api_token)
-start_date = (datetime.now() - timedelta(days=lookback)).strftime('%Y-%m-%d')
-
-if st.sidebar.button("確認查詢"):
-    with st.spinner('🎬 正在同步三竹雲端數據...'):
-        # 抓取三位一體數據
-        price_df = safe_fetch(loader, loader.taiwan_stock_daily, stock_id=stock_id, start_date=start_date)
+# --- 3. 數據獲取與分析 ---
+@st.cache_data(ttl=3600)
+def get_clean_data(stock_id, start_date):
+    dl = DataLoader()
+    try:
+        raw_df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
+        df = standardize_columns(raw_df)
         
-        if not price_df.empty:
-            score, status_text = calculate_mitake_style(price_df)
-            
-            # --- 頂部診斷區 (三竹智選股風格) ---
-            st.markdown(f"### 📊 {stock_id} 綜合診斷報告")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(f"<div class='status-card'>評分<br><h1>{score}</h1></div>", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"<div class='status-card'>訊號<br><h3>{status_text}</h3></div>", unsafe_allow_html=True)
-            with c3:
-                vol_ratio = round(price_df.iloc[-1]['volume'] / price_df['volume'].tail(20).mean(), 2)
-                st.markdown(f"<div class='status-card'>量能倍數<br><h3>{vol_ratio}x</h3></div>", unsafe_allow_html=True)
+        if df.empty: return None
+        
+        # 技術指標計算
+        df['ma20'] = ta.sma(df['close'], length=20)
+        df['vol_ma20'] = ta.sma(df['volume'], length=20)
+        
+        inst = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
+        return {"price": df, "inst": inst}
+    except:
+        return None
 
-            # --- 專業圖表區 ---
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-            
-            # K線圖
-            fig.add_trace(go.Candlestick(x=price_df['date'], open=price_df['open'], high=price_df['high'], 
-                                         low=price_df['low'], close=price_df['close'], 
-                                         increasing_line_color='#ff4b4b', decreasing_line_color='#00f200', name='K線'), row=1, col=1)
-            
-            # 自動標註買點 (起漲點箭頭)
-            signals = (price_df['close'] > price_df['close'].shift(1)*1.02) & (price_df['volume'] > price_df['volume'].rolling(20).mean()*1.5)
-            sig_df = price_df[signals]
-            fig.add_trace(go.Scatter(x=sig_df['date'], y=sig_df['low']*0.97, mode='markers', 
-                                     marker=dict(symbol='triangle-up', size=12, color='#ff4b4b'), name='起漲點'), row=1, col=1)
+# --- 4. 主程式 ---
+st.title("🏹 飆股動能分析儀")
 
-            # 成交量圖
-            v_colors = ['#ff4b4b' if c > o else '#00f200' for c, o in zip(price_df['close'], price_df['open'])]
-            fig.add_trace(go.Bar(x=price_df['date'], y=price_df['volume'], marker_color=v_colors, name='成交量'), row=2, col=1)
+stock_id = st.sidebar.text_input("📍 股票代碼", value="2330")
+lookback = st.sidebar.slider("回溯天數", 60, 365, 120)
+start_dt = (datetime.now() - timedelta(days=lookback)).strftime('%Y-%m-%d')
 
-            fig.update_layout(height=600, template='plotly_dark', plot_bgcolor='#050505', paper_bgcolor='#050505',
-                              margin=dict(l=20, r=20, t=20, b=20), xaxis_rangeslider_visible=False)
-            fig.update_xaxes(showgrid=False)
-            fig.update_yaxes(showgrid=False)
-            st.plotly_chart(fig, use_container_width=True)
-            
-        else:
-            st.error("🚨 數據調用達到上限或伺服器忙碌。請 1. 檢查代碼是否正確 2. 填寫 Token 3. 稍後重試。")
+data = get_clean_data(stock_id, start_dt)
 
+if data:
+    df = data['price']
+    latest = df.iloc[-1]
+    
+    # 診斷得分邏輯
+    score = 0
+    if latest['close'] > latest['ma20']: score += 40
+    if latest['volume'] > latest['vol_ma20'] * 1.5: score += 40
+    if latest['close'] > df.iloc[-2]['close']: score += 20
+    
+    # --- 頂部摘要區 ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("當前得分", f"{score} 分", "強勢" if score >= 80 else "中性")
+    with c2:
+        # 修正原本報錯的 vol_ratio 位置，加入安全檢查
+        v_ratio = round(latest['volume'] / df['volume'].tail(20).mean(), 2) if df['volume'].tail(20).mean() != 0 else 0
+        st.metric("成交量倍數", f"{v_ratio} 倍")
+    with c3:
+        st.metric("收盤價", f"{latest['close']} 元")
+
+    # --- 專業圖表呈現 ---
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+
+    # K線與起漲箭頭
+    fig.add_trace(go.Candlestick(x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K線'), row=1, col=1)
+    
+    # 標記起漲點 (量增價揚且破20MA)
+    sig = (df['close'] > df['ma20']) & (df['volume'] > df['vol_ma20'] * 1.5)
+    sig_df = df[sig]
+    fig.add_trace(go.Scatter(x=sig_df['date'], y=sig_df['low']*0.98, mode='markers', 
+                             marker=dict(symbol='triangle-up', size=15, color='#ff4b4b'), name='起漲訊號'), row=1, col=1)
+
+    # 成交量柱狀圖
+    fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color='#333'), row=2, col=1)
+
+    fig.update_layout(height=700, template='plotly_dark', xaxis_rangeslider_visible=False, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.error("❌ 數據解析失敗。原因可能是：1. 代碼錯誤 2. API 頻率限制 3. 該時段無交易。請稍後再試。")
